@@ -27,6 +27,10 @@ services:
       PG_HOST: ""
       PG_USER: ""
       PG_PASSWORD: ""
+      # Usados somente pelas CLIs explícitas; não habilitam diagnóstico ou aquisição no boot.
+      WORKER_PG_HOST: postgres
+      WORKER_PG_PORT: "5432"
+      WORKER_PG_DATABASE: olos_worker
       SHUTDOWN_TIMEOUT_MS: "20000"
     volumes:
       # Inclui first-run/spool, replay-spool, claims e intenções; não dividir o caso.

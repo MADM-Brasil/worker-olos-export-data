@@ -144,7 +144,7 @@ export async function corporateCommand(args:readonly string[],env:NodeJS.Process
    const spool=await LocalSpool.open(join(root,'spool'),spoolLimits());
    if(!await exists(join(base,'remote-pending.json')))throw Error('RECOVERY_REQUIRES_REVIEW');
    const pending=await privateJson(join(base,'remote-pending.json')) as {workDir:string};if(pending.workDir!==root)throw Error('REMOTE_INTENT_CHANGED');
-   const {passwords}=await localSettings();await runLocalCycle(action,createLocalRuntimePools(passwords,()=>{}),spool,binding,'review');return;
+   const {passwords,postgres}=await localSettings();await runLocalCycle(action,createLocalRuntimePools(passwords,()=>{},postgres),spool,binding,'review');return;
  }
  // Everything is explicit, private and validated before touching PostgreSQL or opening a source.
  const cfg=await readCorporateConfiguration(options.configFile);
@@ -192,8 +192,8 @@ export async function corporateCommand(args:readonly string[],env:NodeJS.Process
      if(ack.configurationDigest!==intent.configurationDigest || (ack.acquisitionScopeDigest?ack.acquisitionScopeDigest!==binding.acquisitionScopeDigest:ack.configurationDigest!==binding.configurationDigest))throw Error('RECOVERY_REQUIRED');confirmed++;}
  }
  if(state.pending)throw Error('RECOVERY_REQUIRED');state.next=confirmed%2?'previous':'current';
- const {config,passwords}=await localSettings();
- const spool=await LocalSpool.open(join(root,'spool'),spoolLimits()),pools=createLocalRuntimePools(passwords,()=>{});
+ const {config,passwords,postgres}=await localSettings();
+ const spool=await LocalSpool.open(join(root,'spool'),spoolLimits()),pools=createLocalRuntimePools(passwords,()=>{},postgres);
  if(action==='start'){
    const runtime=createAutomatedAttemptsService(pools,spool,spoolLimits(),binding,options.intervalMs);
    await serveWorker({...config,SYNC_INTERVAL_MS:options.intervalMs},[{name:'postgres',configured:true,probe:()=>runtime.probe(),close:async()=>{}}],runtime);return;
@@ -233,8 +233,8 @@ async function recoverObservedResponse(options:ReturnType<typeof parseCorporateA
    const saved=await privateJson(startedPath) as {digest:string};if(saved.digest!==replayDigest)throw Error('MAPPING_CHANGED');
    if(!await spool.active())throw Error('RECOVERY_REQUIRES_REVIEW'); // never blindly create a second run after uncertain local commit
  }else await durableExclusive(startedPath,{digest:replayDigest});
- const {passwords}=await localSettings();
- await runLocalCycle(started?'recover':'capture-replay',createLocalRuntimePools(passwords,()=>{}),spool,binding,null);
+ const {passwords,postgres}=await localSettings();
+ await runLocalCycle(started?'recover':'capture-replay',createLocalRuntimePools(passwords,()=>{},postgres),spool,binding,null);
  await durableExclusive(confirmedPath,{attemptId:claim.attemptId,digest:replayDigest});
  }
  // Tie the original observed acquisition to the subsequently reviewed contract, without rewriting its intent.
@@ -272,8 +272,8 @@ async function observeCorporateResponse(options:ReturnType<typeof parseCorporate
    await privateDirectory(root);
    if((await readdir(root)).some(name=>/^attempt-[a-f0-9-]+\.json$/.test(name)))throw Error('RECOVERY_REQUIRED');
  }
- const {passwords}=await localSettings(),abort=new AbortController(),cancel=()=>abort.abort();
- const pools=createLocalRuntimePools(passwords,cancel),probe=new AttemptsService(pools);
+ const {passwords,postgres}=await localSettings(),abort=new AbortController(),cancel=()=>abort.abort();
+ const pools=createLocalRuntimePools(passwords,cancel,postgres),probe=new AttemptsService(pools);
  let lock:PoolClient|undefined,capture:Awaited<ReturnType<LocalSpool['createResponseCapture']>>|undefined,storageFailure:unknown;
  process.once('SIGTERM',cancel);process.once('SIGINT',cancel);
  try{

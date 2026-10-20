@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
-    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.adapters.json && node scripts/build-spool-adapter.mjs",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.cli.json && node scripts/build-spool-adapter.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "integration:disposition": "tsx adapters/disposition-integration.ts",

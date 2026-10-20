@@ -8,20 +8,26 @@ import {parse} from 'dotenv';
 import {z} from 'zod';
 import {loadConfig} from '../src/config/env.js';
 import {serveWorker} from '../src/main.js';
-import {createLocalRuntimePools} from '../src/integration/attempts/pools.js';
+import {createLocalRuntimePools,runtimePostgresTarget} from '../src/integration/attempts/pools.js';
 import {AttemptsService} from '../src/integration/attempts/service.js';
 
-const secretSchema=z.object({olos_ingest_login:z.string().min(1),olos_project_login:z.string().min(1),olos_receiver_login:z.string().min(1)}).strict();
+const secretSchema=z.object({olos_ingest_login:z.string().min(1),olos_project_login:z.string().min(1),olos_receiver_login:z.string().min(1)}).strict()
+  .refine(value=>new Set(Object.values(value)).size===3);
 async function secret(path:string){
   const s=await lstat(path);if(!s.isFile() || s.isSymbolicLink() || s.uid!==process.getuid?.() || s.mode&0o077 || await realpath(path)!==path || s.size>32768)throw Error('PRIVATE_CONFIGURATION_REQUIRED');
   const f=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);try{return await f.readFile('utf8');}finally{await f.close();}
 }
-export async function localSettings(){
+export async function localSettings(runtimeEnv:NodeJS.ProcessEnv=process.env){
   const dir=join(homedir(),'.config','olos-worker');
   const parent=await lstat(dir);if(!parent.isDirectory() || parent.uid!==process.getuid?.() || parent.mode&0o022)throw Error('PRIVATE_CONFIGURATION_REQUIRED');
   const env=parse(await secret(join(dir,'worker-local.env')));
-  if(env.SYNC_ENABLED!=='false' || env.PG_HOST!=='127.0.0.1' || env.PG_PORT!=='5434' || env.PG_DATABASE!=='olos_worker')throw Error('LOCAL_CONFIGURATION_REJECTED');
-  const passwords=secretSchema.parse(JSON.parse(await secret(join(dir,'postgres-credentials.json'))));
+  if(env.SYNC_ENABLED!=='false' || runtimeEnv.SYNC_ENABLED!==undefined && runtimeEnv.SYNC_ENABLED!=='false')throw Error('LOCAL_CONFIGURATION_REJECTED');
+  // Dedicated variables do not configure the generic boot diagnostic or accept an admin login.
+  const postgres=runtimePostgresTarget({host:runtimeEnv.WORKER_PG_HOST??env.PG_HOST??'127.0.0.1',
+    port:runtimeEnv.WORKER_PG_PORT??env.PG_PORT??'5434',database:runtimeEnv.WORKER_PG_DATABASE??env.PG_DATABASE??'olos_worker'});
+  let passwords:z.infer<typeof secretSchema>;
+  try{passwords=secretSchema.parse(JSON.parse(await secret(join(dir,'postgres-credentials.json'))));}
+  catch{throw Error('PRIVATE_RUNTIME_CREDENTIALS_INVALID');}
   // Ignore generic insecure-TLS flags in the legacy env: they never reach SQL Server options.
   const selected:NodeJS.ProcessEnv={SYNC_ENABLED:'false'};
   for(const k of ['HTTP_HOST','HTTP_PORT','LOG_LEVEL','SYNC_INTERVAL_MS','SHUTDOWN_TIMEOUT_MS','STATUS_TOKEN'])if(env[k]!==undefined)selected[k]=env[k];
@@ -31,22 +37,23 @@ export async function localSettings(){
   if(!selected.STATUS_TOKEN){
     try{selected.STATUS_TOKEN=(await secret(tokenPath)).trim();}
     catch(e){if(!(e && typeof e==='object' && 'code' in e && e.code==='ENOENT'))throw e;
+      if(runtimeEnv.NODE_ENV==='production')throw Error('PRIVATE_STATUS_TOKEN_REQUIRED');
       const token=randomBytes(32).toString('hex');let f;
       try{f=await open(tokenPath,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);await f.writeFile(token);await f.sync();}
       catch(error){if(!(error && typeof error==='object' && 'code' in error && error.code==='EEXIST'))throw error;}
       finally{await f?.close();}selected.STATUS_TOKEN=(await secret(tokenPath)).trim();
     }
   }
-  return {config:loadConfig(selected),passwords};
+  return {config:loadConfig(selected),passwords,postgres};
 }
 export async function localCommand(action:string){
-  const {config,passwords}=await localSettings();
+  const {config,passwords,postgres}=await localSettings();
   if(action==='status'){
     const r=await fetch(`http://127.0.0.1:${config.HTTP_PORT}/status`,{headers:{authorization:`Bearer ${config.STATUS_TOKEN}`},signal:AbortSignal.timeout(5000)});
     if(!r.ok)throw Error('LOCAL_STATUS_UNAVAILABLE');process.stdout.write(`${JSON.stringify(await r.json())}\n`);return;
   }
   if(action!=='start' && action!=='check')throw Error('LOCAL_COMMAND_REJECTED');
-  const pools=createLocalRuntimePools(passwords,()=>process.stderr.write('{"event":"local_postgres_pool_error"}\n'));
+  const pools=createLocalRuntimePools(passwords,()=>process.stderr.write('{"event":"local_postgres_pool_error"}\n'),postgres);
   const runtime=new AttemptsService(pools,config.SYNC_INTERVAL_MS);
   if(action==='check'){try{await runtime.probe();process.stdout.write(`${JSON.stringify(runtime.snapshot())}\n`);}finally{await runtime.stop();}return;}
   await serveWorker(config,[{name:'postgres',configured:true,probe:()=>runtime.probe(),close:async()=>{}},{name:'olos',configured:false,probe:async()=>{throw Error('SOURCE_BLOCKED');},close:async()=>{}}],runtime);

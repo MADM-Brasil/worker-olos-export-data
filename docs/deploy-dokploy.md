@@ -26,6 +26,7 @@ O Dokploy suporta [build em Compose, volumes nomeados e arquivos em `../files`](
 | Item | Valor/local | Operação |
 | --- | --- | --- |
 | `WORKER_LOG_LEVEL` | `info` (opcional no painel) | Única variável interpolada; usar `info`, `warn` ou `error` em produção. |
+| `WORKER_PG_HOST` / `WORKER_PG_PORT` / `WORKER_PG_DATABASE` | `postgres` / `5432` / `olos_worker` no Compose | Destino dos três pools das CLIs de runtime; sem usuário/senha administrativos. Ver [integração de runtime](dokploy-runtime-postgres.md). |
 | `SYNC_ENABLED` | `false` literal no Compose | Não habilitar; `true` é rejeitado pelo runtime. |
 | `HTTP_HOST` / `HTTP_PORT` | `0.0.0.0` / `3000` internos | Sem publicação no host ou Traefik. |
 | `STATUS_TOKEN` | vazio | Endpoint administrativo desabilitado nesta etapa. |
@@ -117,9 +118,9 @@ No host, usando os IDs **deste projeto**: inspecionar `docker inspect <worker-id
 
 ## Limite para ativação e resultado incerto
 
-A imagem final contém o boot compilado e o adaptador de spool; `tsx` e as CLIs TypeScript de operação não estão na imagem final. Os adaptadores corporativos atuais dependem de paths privados e dos pools locais fixos `127.0.0.1:5434`, incompatíveis com o serviço Compose `postgres:5432`. Portanto, este deploy **não é a ativação corporativa** e não há um comando `worker:attempts` pronto para executar no container. Não contornar isso compartilhando rede do host, publicando PostgreSQL ou usando o administrador como runtime.
+A imagem final contém o boot e as CLIs compiladas, sem depender de `tsx` em produção. `npm run worker:local -- check` verifica o PostgreSQL dedicado por três logins; `npm run worker:attempts -- status` continua sendo um diagnóstico de arquivos sem rede. Os pools aceitam `WORKER_PG_*` para `postgres:5432`, preservando o padrão local `127.0.0.1:5434`. Preparar os arquivos privados e seguir o [procedimento de redeploy somente do worker](dokploy-runtime-postgres.md); o comando de boot permanece `node dist/main.js`.
 
-Uma entrega posterior precisa adaptar explicitamente a configuração dos pools para o destino isolado, revisar contratos/grants reais, rede corporativa, TLS de aquisição aprovado, autorização/recuperação reais e mounts dos catálogos/perfil com caminhos válidos. Primeiro executar uma única leitura `observe` autorizada, confirmar `response.json`/digest/completude em quarentena, aprovar o contrato observado e só então autorizar replay/recorrência. A confirmação da primeira leitura/entrega e o contrato independente PreviousDays continuam exigidos pelo fluxo existente. Não executar `recover` ou `start` para descobrir se está configurado.
+Uma ativação posterior precisa revisar contratos/grants reais, rede corporativa, TLS de aquisição aprovado, autorização/recuperação reais e mounts dos catálogos/perfil com caminhos válidos. Primeiro executar uma única leitura `observe` autorizada, confirmar `response.json`/digest/completude em quarentena, aprovar o contrato observado e só então autorizar replay/recorrência. A confirmação da primeira leitura/entrega e o contrato independente PreviousDays continuam exigidos pelo fluxo existente. Não executar `once`, `recover` ou `start` para descobrir se está configurado.
 
 Se uma operação futura cair com resultado remoto incerto: parar, preservar volume/caso/claim/intenção, revisar recibos e conciliar pela etapa externa LogReadData/ReReadData autorizada. Não fazer retry remoto, apagar pendências, criar outro diretório para repetir, nem usar ResetReadData. O boot atual não contém nenhuma leitura remota; `restart: no`, ausência de cron/Auto Deploy e rede interna evitam reexecução automática por este deploy.
 

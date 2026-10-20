@@ -25,6 +25,8 @@ WORKDIR /app
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node package.json ./
+RUN npm pkg set 'scripts.worker:local=node dist/cli/adapters/local-worker.js' \
+    'scripts.worker:attempts=node dist/cli/adapters/attempts-corporate.js'
 RUN mkdir -p /home/node/.local/state/olos-worker /home/node/.config/olos-worker \
     && chown -R node:node /home/node/.local /home/node/.config \
     && chmod 700 /home/node/.local/state/olos-worker /home/node/.config/olos-worker
