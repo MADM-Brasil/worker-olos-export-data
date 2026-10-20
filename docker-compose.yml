@@ -1,0 +1,93 @@
+# Dokploy: tipo Docker Compose, contexto raiz; nenhum domínio/porta pública.
+services:
+  worker:
+    build:
+      context: .
+      target: runtime
+    command: ["node", "dist/main.js"]
+    init: true
+    restart: "no"
+    scale: 1
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 30s
+    mem_limit: 512m
+    cpus: 0.50
+    pids_limit: 128
+    environment:
+      NODE_ENV: production
+      HOME: /home/node
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "3000"
+      LOG_LEVEL: ${WORKER_LOG_LEVEL:-info}
+      SYNC_ENABLED: "false"
+      STATUS_TOKEN: ""
+      OLOS_PASSWORD: ""
+      PG_HOST: ""
+      PG_USER: ""
+      PG_PASSWORD: ""
+      SHUTDOWN_TIMEOUT_MS: "20000"
+    volumes:
+      # Inclui first-run/spool, replay-spool, claims e intenções; não dividir o caso.
+      - worker_state:/home/node/.local/state/olos-worker
+      - type: bind
+        source: ../files/olos-private
+        target: /home/node/.config/olos-worker
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks: [isolated]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    build:
+      context: .
+      target: database
+    restart: unless-stopped
+    stop_grace_period: 60s
+    mem_limit: 512m
+    cpus: 0.50
+    pids_limit: 128
+    environment:
+      POSTGRES_DB: olos_worker
+      POSTGRES_USER: olos_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    secrets: [postgres_admin_password]
+    volumes:
+      # Contém também os checkpoints/recibos nas tabelas olos_export.
+      - postgres_data:/var/lib/postgresql/data
+    networks: [isolated]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U olos_admin -d olos_worker"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  isolated:
+    internal: true
+
+volumes:
+  postgres_data:
+  worker_state:
+
+secrets:
+  postgres_admin_password:
+    file: ../files/olos-secrets/postgres-admin-password

@@ -1,5 +1,7 @@
 # worker-olos-export-data
 
+Deploy isolado sem aquisição: [Dokploy, volumes, migrations manuais e verificações](docs/deploy-dokploy.md). A transferência dos 570 históricos tem [plano separado](docs/historical-migration-plan.md) e não faz parte do deploy.
+
 Serviço local integrado: [automação e operação segura](docs/local-worker-automation.md). `npm run worker:local -- check`, `start` e `status` usam os três logins do PostgreSQL local, preservam o histórico e mostram estatísticas reais. A composição automática de spool/ingestão/outbox/entrega foi testada com fixtures; aquisição corporativa continua explicitamente bloqueada.
 
 O [catálogo global de agentes](docs/global-agent-catalog.md) prepara o relacionamento Users.AgentId → UserName e o enriquecimento histórico transacional, com snapshots locais sanitizados e sem aquisição corporativa Users. O ambiente de homologação já existente exige adoção manual revisada da migration; não é atualizado no boot.
@@ -14,7 +16,7 @@ A [Fase 3B](docs/phase3b-olos-contracts.md) consolida os seis layouts do manual 
 
 ## Desenvolvimento
 
-Requer Node.js 20.19+ e npm. A imagem usa Node 20 por requisito inicial; planejar atualização para LTS suportada antes da operação produtiva, repetindo os testes e validando TLS/drivers.
+Requer uma versão compatível com `engines` em package.json e npm. A imagem de produção usa Node.js 22 (Debian Bookworm), com dependências instaladas pelo lockfile.
 
 ```bash
 npm install
