@@ -1,0 +1,97 @@
+import type { Pool,PoolClient } from 'pg';
+import { AttemptsRuntimeControl,type WorkerRuntime,type CycleCounts } from './runtime-control.js';
+import { attemptsBlockers } from './contracts.js';
+import { APPROVED_COLUMNS } from '../../offline/tds-writer.js';
+
+export interface RuntimePools {ingest:Pool;project:Pool;receiver:Pool;}
+export class AttemptsService implements WorkerRuntime {
+  private readonly control:AttemptsRuntimeControl;
+  private database:'unknown'|'up'|'down'='unknown';
+  private schemaReady=false;
+  private aggregates:Record<string,unknown>={totalCalls:null,withCpf:null,withEmail:null,withAgentName:null,pendingDeliveries:null,confirmedDeliveries:null,checkpoints:[]};
+  private refreshTask:Promise<void>|undefined;
+  private starting:Promise<void>|undefined;
+  private closing:Promise<void>|undefined;
+  private lock:PoolClient|undefined;
+  private stopping=false;
+  private checkedAt:string|null=null;
+  private readonly abort=new AbortController();
+  constructor(readonly pools:RuntimePools,private readonly intervalMs=60000,
+    private readonly authorizedCycle?: (signal:AbortSignal)=>Promise<CycleCounts>,private readonly sourceKind='isolated-fixture') {
+    this.control=new AttemptsRuntimeControl(intervalMs);
+    this.control.block(['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]);
+  }
+  async probe():Promise<void>{
+    if(!this.refreshTask)this.refreshTask=this.refresh().finally(()=>{this.refreshTask=undefined;});return this.refreshTask;
+  }
+  private async refresh(){
+    let connected=false;
+    try {
+      for(const [pool,login] of [[this.pools.ingest,'olos_ingest_login'],[this.pools.project,'olos_project_login'],[this.pools.receiver,'olos_receiver_login']] as const){
+        const c=await pool.connect();try{await c.query('BEGIN READ ONLY');
+          const r=(await c.query("SELECT session_user AS login,current_setting('is_superuser') AS superuser")).rows[0];
+          if(r.login!==login || r.superuser!=='off')throw Error('ROLE_REJECTED');await c.query('COMMIT');
+        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
+      }
+      connected=true;
+      this.database='up';
+      const required:[Pool,string[],string][]=[
+        [this.pools.ingest,['streams','runs','source_locks','batches','checkpoints','attempts_raw_data'],'SELECT,INSERT,UPDATE'],
+        [this.pools.ingest,['large_batch_receipts','large_batch_keys','projection_batches','projection_outbox','audit_events'],'SELECT,INSERT'],
+        [this.pools.project,['projection_outbox'],'SELECT'],[this.pools.project,['projection_events'],'SELECT,INSERT'],
+        [this.pools.receiver,['delivery_receipts'],'SELECT,INSERT']
+      ];
+      for(const [pool,tables,privileges] of required)for(const table of tables){
+        const r=(await pool.query('SELECT bool_and(has_table_privilege(current_user,$1,p)) AS allowed FROM unnest($2::text[]) AS p',[`olos_export.${table}`,privileges.split(',')])).rows[0];
+        if(!r.allowed)throw Error('PRIVILEGE_REJECTED');
+      }
+      const projectColumns=['state','generation','lease_owner','lease_until','attempts','available_at','attempt_id','request_payload','request_digest','last_code','confirmed_at'];
+      if(!(await this.pools.project.query("SELECT bool_and(has_column_privilege(current_user,'olos_export.projection_outbox',c,'UPDATE')) AS allowed FROM unnest($1::text[]) AS c",[projectColumns])).rows[0].allowed)throw Error('PRIVILEGE_REJECTED');
+      const c=await this.pools.receiver.connect();
+      try{await c.query('BEGIN READ ONLY');
+        const cols=(await c.query(`SELECT column_name,udt_name,datetime_precision FROM information_schema.columns WHERE table_schema='raw' AND table_name='olos_calls' ORDER BY ordinal_position`)).rows;
+        if(cols.length!==16 || cols.some((r,i)=>r.column_name!==APPROVED_COLUMNS[i] || r.udt_name!==(i===0 || i===15?'int8':i===2?'timestamp':i===13?'int4':'text')) || cols[2].datetime_precision!==6)throw Error('SCHEMA_REJECTED');
+        const pk=(await c.query(`SELECT array_agg(a.attname::text ORDER BY k.ord) AS keys FROM pg_constraint p
+          CROSS JOIN LATERAL unnest(p.conkey) WITH ORDINALITY k(attnum,ord) JOIN pg_attribute a ON a.attrelid=p.conrelid AND a.attnum=k.attnum
+          WHERE p.conrelid='raw.olos_calls'::regclass AND p.contype='p'`)).rows[0].keys;
+        if(JSON.stringify(pk)!==JSON.stringify(['internal_id_olos']))throw Error('SCHEMA_REJECTED');
+        for(const privilege of ['SELECT','INSERT'])if(!(await c.query("SELECT has_table_privilege(current_user,'raw.olos_calls',$1) AS allowed",[privilege])).rows[0].allowed)throw Error('PRIVILEGE_REJECTED');
+        const calls=(await c.query(`SELECT count(*)::text AS "totalCalls",count(cpf)::text AS "withCpf",count(email)::text AS "withEmail",count(nome_agente)::text AS "withAgentName" FROM raw.olos_calls`)).rows[0];
+        await c.query('COMMIT');this.aggregates={...this.aggregates,...calls};
+      }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
+      const outbox=(await this.pools.project.query(`SELECT count(*) FILTER(WHERE state<>'confirmed')::text AS "pendingDeliveries",count(*) FILTER(WHERE state='confirmed')::text AS "confirmedDeliveries" FROM olos_export.projection_outbox`)).rows[0];
+      const checkpoints=(await this.pools.ingest.query(`SELECT c.version::text,c.last_batch_id FROM olos_export.checkpoints c JOIN olos_export.streams s ON s.id=c.stream_id WHERE s.source_table='AttemptsRawData' ORDER BY s.id`)).rows;
+      const totals=(await this.pools.ingest.query(`SELECT coalesce(sum(received_count),0)::text AS received,coalesce(sum(persisted_count),0)::text AS persisted,
+        coalesce(sum(duplicate_count),0)::text AS duplicates,count(*) FILTER(WHERE state IN ('read_intent','persisting','needs_reconciliation'))::text AS unresolved
+        FROM olos_export.runs WHERE source_table='AttemptsRawData'`)).rows[0];
+      this.aggregates={...this.aggregates,...outbox,checkpoints,ingestionTotals:totals};this.schemaReady=true;this.checkedAt=new Date().toISOString();
+      if(!this.authorizedCycle && !this.stopping)this.control.block(['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]);
+    }catch {this.schemaReady=false;this.database=connected?'up':'down';if(this.authorizedCycle && this.control.snapshot().armed)this.control.requireReconciliation();throw Error('POSTGRES_RUNTIME_NOT_READY');}
+  }
+  start():Promise<void>{
+    if(this.starting)return this.starting;
+    this.starting=(async()=>{
+      try {await this.probe();if(this.stopping || !this.authorizedCycle)return;
+        const lock=await this.pools.ingest.connect();this.lock=lock;
+        lock.on('error',()=>{this.abort.abort();this.control.requireReconciliation();});
+        if(!(await lock.query('SELECT pg_try_advisory_lock(740219,1) AS acquired')).rows[0].acquired)throw Error('INSTANCE_BUSY');
+        this.control.start(async signal=>{
+          if(this.abort.signal.aborted || this.stopping)throw Error('INSTANCE_LOST');
+          const combined=AbortSignal.any([signal,this.abort.signal]);
+          await this.probe();
+          try{return await this.authorizedCycle!(combined);}finally{await this.probe().catch(()=>{});}
+        });
+      }catch {this.control.block(['POSTGRES_SCHEMA_ROLE_OR_INSTANCE_NOT_READY',...(!this.authorizedCycle?['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]:[])]);}
+    })();return this.starting;
+  }
+  ready(){const s=this.control.snapshot();return !this.stopping && !this.abort.signal.aborted && this.schemaReady && s.enabled;}
+  snapshot(){const totals=this.aggregates.ingestionTotals as {unresolved:string}|undefined;
+    return {...this.control.snapshot(),enabled:this.ready(),countsScope:'ingestion_last_completed_cycle',sourceConfigured:Boolean(this.authorizedCycle),sourceAuthorized:Boolean(this.authorizedCycle),
+    sourceKind:this.authorizedCycle?this.sourceKind:'corporate-blocked',databaseState:this.database,schemaReady:this.schemaReady,statisticsAvailable:this.schemaReady,statisticsCheckedAt:this.checkedAt,
+    recoveryPending:this.control.snapshot().state==='needs_reconciliation' || Boolean(totals && totals.unresolved!=='0') || Number(this.aggregates.pendingDeliveries)>0,...this.aggregates};}
+  stop():Promise<void>{this.closing ??=this.close();return this.closing;}
+  private async close(){this.stopping=true;this.abort.abort();await this.starting;await this.control.stop();await this.refreshTask?.catch(()=>{});
+    if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(740219,1)').catch(()=>{});this.lock.release(true);this.lock=undefined;}
+    const results=await Promise.allSettled(Object.values(this.pools).map(p=>p.end()));if(results.some(r=>r.status==='rejected'))throw Error('RUNTIME_POOL_CLOSE_FAILED');
+  }
+}

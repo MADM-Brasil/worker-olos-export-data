@@ -1,0 +1,46 @@
+{
+  "name": "worker-olos-export-data",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fundação independente do worker Olos ExportData para MADM",
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || >=24.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.adapters.json && node scripts/build-spool-adapter.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "integration:disposition": "tsx adapters/disposition-integration.ts",
+    "diagnose:olos-tls": "tsx adapters/olos-tls-diagnostic.ts",
+    "diagnose:olos-metadata": "tsx adapters/olos-metadata-diagnostic.ts",
+    "integration:attempts": "tsx adapters/attempts-integration.ts",
+    "homologation:offline": "tsx adapters/offline-homologation.ts",
+    "worker:local": "tsx adapters/local-worker.ts",
+    "worker:attempts": "tsx adapters/attempts-corporate.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "fastify": "^5.6.1",
+    "lossless-json": "4.3.2",
+    "mssql": "^11.0.1",
+    "pg": "^8.16.3",
+    "pino": "^9.14.0",
+    "saxes": "6.0.0",
+    "tedious": "18.6.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/mssql": "^9.1.8",
+    "@types/node": "^20.19.0",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "light-my-request": "6.6.0"
+  }
+}

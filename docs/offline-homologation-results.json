@@ -1,0 +1,118 @@
+{
+  "dataset": "SYNTHETIC_ONLY",
+  "realBatchValidated": false,
+  "sqlServerConnections": 0,
+  "firstImport": {
+    "ok": true,
+    "event": "offline_cycle_complete",
+    "freshness": "historical-offline",
+    "sqlServerQueries": 0,
+    "inputRows": 570,
+    "uniqueInputRows": 570,
+    "duplicatesInFile": 0,
+    "expected": 570,
+    "confirmed": 570,
+    "complete": true,
+    "metrics": {
+      "cpf": 218,
+      "tma": 21,
+      "email": 264,
+      "invalidXml": 0,
+      "ambiguousXml": 0,
+      "missingCampaign": 0,
+      "missingTimestamp": 0,
+      "missingDisposition": 0
+    },
+    "rows": "570",
+    "unique_rows": "570",
+    "ingestionCheckpoint": "1",
+    "sourceObservedNow": false
+  },
+  "secondImport": {
+    "ok": true,
+    "event": "offline_cycle_complete",
+    "freshness": "historical-offline",
+    "sqlServerQueries": 0,
+    "inputRows": 570,
+    "uniqueInputRows": 570,
+    "duplicatesInFile": 0,
+    "expected": 570,
+    "confirmed": 570,
+    "complete": true,
+    "metrics": {
+      "cpf": 218,
+      "tma": 21,
+      "email": 264,
+      "invalidXml": 0,
+      "ambiguousXml": 0,
+      "missingCampaign": 0,
+      "missingTimestamp": 0,
+      "missingDisposition": 0
+    },
+    "rows": "570",
+    "unique_rows": "570",
+    "ingestionCheckpoint": "1",
+    "sourceObservedNow": false
+  },
+  "cycleCount": 2,
+  "cycleGapSeconds": 60.165,
+  "cycleSummaries": [
+    {
+      "event": "offline_cycle_complete",
+      "freshness": "historical-offline",
+      "sqlServerQueries": 0,
+      "inputRows": 570,
+      "uniqueInputRows": 570,
+      "duplicatesInFile": 0,
+      "expected": 570,
+      "confirmed": 570,
+      "complete": true,
+      "metrics": {
+        "cpf": 218,
+        "tma": 21,
+        "email": 264,
+        "invalidXml": 0,
+        "ambiguousXml": 0,
+        "missingCampaign": 0,
+        "missingTimestamp": 0,
+        "missingDisposition": 0
+      },
+      "rows": "570",
+      "unique_rows": "570",
+      "ingestionCheckpoint": "1",
+      "sourceObservedNow": false
+    },
+    {
+      "event": "offline_cycle_complete",
+      "freshness": "historical-offline",
+      "sqlServerQueries": 0,
+      "inputRows": 570,
+      "uniqueInputRows": 570,
+      "duplicatesInFile": 0,
+      "expected": 570,
+      "confirmed": 570,
+      "complete": true,
+      "metrics": {
+        "cpf": 218,
+        "tma": 21,
+        "email": 264,
+        "invalidXml": 0,
+        "ambiguousXml": 0,
+        "missingCampaign": 0,
+        "missingTimestamp": 0,
+        "missingDisposition": 0
+      },
+      "rows": "570",
+      "unique_rows": "570",
+      "ingestionCheckpoint": "1",
+      "sourceObservedNow": false
+    }
+  ],
+  "explicitStop": {
+    "ok": true,
+    "stopRequested": true
+  },
+  "runnerExitCode": 0,
+  "runnerClaimRemoved": true,
+  "aggregateLogsWithoutFixturePii": true
+}

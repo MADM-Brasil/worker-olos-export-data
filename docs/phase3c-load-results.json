@@ -1,0 +1,24 @@
+{
+  "result": {
+    "received": 200000,
+    "persisted": 200000,
+    "duplicates": 0,
+    "rejected": 0
+  },
+  "saved": "200000",
+  "checkpoint": "1",
+  "sourceCalls": 1,
+  "milliseconds": 39255,
+  "baselineHeap": 24006008,
+  "baselineRss": 116129792,
+  "peakHeap": 37719304,
+  "peakRss": 129761280,
+  "heapLimit": 146800640,
+  "spoolBytes": 88088895,
+  "peakBufferedBytes": 65411,
+  "configuredBufferBytes": 65536,
+  "chunkRows": 500,
+  "chunkBytes": 2097152,
+  "syncs": 88,
+  "writes": 1356
+}
