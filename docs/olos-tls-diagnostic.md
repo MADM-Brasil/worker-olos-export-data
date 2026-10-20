@@ -33,7 +33,7 @@ Orçamento total de 10 segundos, 256 KiB recebidos e 16 KiB para a resposta inic
 
 A API [TLS do Node.js](https://nodejs.org/docs/latest-v20.x/api/tls.html) documenta `rejectUnauthorized`, `checkServerIdentity` e `getPeerCertificate`. No modo estrito, falha de verificação pode impedir a obtenção dos metadados; não há fallback automático para inspeção. No modo informativo, o campo `name` informa separadamente se o nome fornecido corresponde ao certificado. `chain=unverified` significa que a verificação TLS não foi aprovada, e não prova, isoladamente, que o emissor seja desconhecido: uma falha de nome também impede a autorização do socket.
 
-O único conteúdo exportado do certificado folha é `subject`, `issuer`, `subjectAltName` (null quando ausente), `validFrom`, `validTo` e `fingerprintSha256`. Nenhum certificado bruto/PEM, chave pública, chave privada, chave de sessão ou conteúdo TDS é impresso. Os campos de estado são códigos fixos, sem mensagens/stack do driver. A saída é JSON para escapar caracteres do certificado.
+A CLI exibe do certificado folha somente `subject`, `issuer`, `validFrom`, `validTo` e `fingerprintSha256`. O núcleo preserva SAN na API de metadados para compatibilidade, mas a CLI não o imprime. Nenhum certificado bruto/PEM, chave privada, chave de sessão ou conteúdo TDS é impresso. Os campos de estado são códigos fixos, sem mensagens/stack do driver. A saída é JSON para escapar caracteres do certificado. A exportação PEM para arquivo privado é opcional e explícita, conforme abaixo.
 
 | Código | Interpretação / ação |
 |---|---|
@@ -80,6 +80,43 @@ SYNC_ENABLED=false npm run diagnose:olos-tls -- \
 Substituir os dois placeholders previamente. A CA pode ser omitida quando a cadeia já pertence à trust store do Node. O arquivo deve conter apenas certificados PEM públicos, ser arquivo regular (sem symlink), com até 128 KiB. A CLI nunca pede chave privada nem altera a trust store. Um arquivo PEM recebido da sessão não deve ser automaticamente promovido a CA confiável.
 
 **Critérios de parada:** qualquer falha, timeout, divergência de nome, cadeia/validade não aprovada ou modo informativo exige revisão humana. Não executar automaticamente um segundo modo, não repetir a conexão, não ativar sync, não mudar `trustServerCertificate`, TLS mínimo, cifras ou `NODE_TLS_REJECT_UNAUTHORIZED`. Comparar fingerprint, SAN, emissor e validade com a equipe responsável por canal independente. Identificar o certificado em uma sessão não prova sua legitimidade nem valida a configuração futura da integração. Uma validação estrita posterior, se necessária, exige nova autorização e fica fora da primeira execução.
+
+## Exportação explícita do certificado público no container
+
+A opção `--export-certificate-pem /caminho/absoluto/arquivo.pem` salva somente o certificado público folha apresentado no mesmo handshake. Não envia LOGIN7/SQL e não lê credenciais ou chamadas. Não gera aprovação de pin. Em `inspect-unverified`, o certificado permanece **observado e não autenticado**, mesmo com exportação concluída.
+
+O diretório pai deve existir, pertencer ao usuário do processo e não permitir acesso de grupo/outros (usar 0700), sem symlinks no caminho. O destino precisa ser novo; arquivo/symlink existente é recusado antes de conectar. Gravação usa staging privado 0600, fsync e publicação sem sobrescrita; disputa pelo nome retorna `CERT_EXPORT_FAILED`, sem reconexão. Falha de TLS não publica PEM; staging é removido ao terminar normalmente. Queda abrupta pode deixar um `.tmp` privado que não deve ser confundido com certificado exportado.
+
+Na imagem de produção, `diagnose:olos-tls` aponta para `node dist/cli/adapters/olos-tls-diagnostic.js`; o checkout de desenvolvimento mantém `tsx`. **Os comandos abaixo exigem a imagem atualizada por um fluxo de redeploy autorizado separado.** Nenhum deploy ou conexão corporativa foi executado nesta implementação.
+
+O mount `/home/node/.config/olos-worker` é readonly; usar o volume de estado já existente para a exportação, sem alterar Compose ou mounts. No host da VPS, depois da atualização autorizada da imagem:
+
+```bash
+WORKER=olos-export-data-workerolosexportdata-ack5ed-worker-1
+
+sudo docker exec "$WORKER" node -e 'const fs=require("node:fs"); const p="/home/node/.local/state/olos-worker/tls-observed"; fs.mkdirSync(p,{recursive:true,mode:0o700}); fs.chmodSync(p,0o700);'
+
+sudo docker exec -e SYNC_ENABLED=false "$WORKER" \
+  npm run diagnose:olos-tls -- \
+  --authorize TDS_TLS_METADATA_ONLY \
+  --mode inspect-unverified \
+  --server-name 10.196.234.11 \
+  --export-certificate-pem /home/node/.local/state/olos-worker/tls-observed/olos-public.pem
+
+echo "exit_code=$?"
+```
+
+Exit 2 com `INSPECTED_UNVERIFIED` é o resultado informativo esperado; arquivo exportado não muda `verified:false`. Exit 64 indica configuração/autorização/destino recusado antes da conexão; exit 1 é falha de diagnóstico/exportação. Não sobrescrever o arquivo nem repetir automaticamente a conexão em falha. Se `CERT_EXPORT_FAILED` ocorrer após publicação, o arquivo pode existir: conferir estado local antes de qualquer outra tentativa.
+
+Conferir 0600 e os dois hashes sem imprimir o PEM:
+
+```bash
+sudo docker exec "$WORKER" node -e 'const fs=require("node:fs"), crypto=require("node:crypto"); const p="/home/node/.local/state/olos-worker/tls-observed/olos-public.pem", s=fs.lstatSync(p); if(!s.isFile()||s.isSymbolicLink()||s.uid!==process.getuid()||(s.mode&0o777)!==0o600)throw Error("PRIVATE_PEM_REQUIRED"); const pem=fs.readFileSync(p), cert=new crypto.X509Certificate(pem); console.log(JSON.stringify({fingerprintSha256:cert.fingerprint256,pemFileSha256:crypto.createHash("sha256").update(pem).digest("hex")}));'
+```
+
+`fingerprintSha256` é o SHA-256 do certificado DER e deve coincidir com o diagnóstico e com a confirmação administrativa independente. `pemFileSha256` é o hash dos bytes do arquivo PEM, útil para conferir transferência; os dois hashes são diferentes por representarem formatos distintos. Nenhum hash observado autoriza a aquisição por si só. Não solicitar nem copiar a chave privada do servidor.
+
+Validação da exportação em 20/10/2026: typecheck/build aprovados; **74 testes direcionados em cinco arquivos** (`tls-certificate-export`, `tls-diagnostic`, `olos-certificate-pin`, `attempts-corporate-pinning`, `attempts-corporate-diagnostics`) passaram. A CLI compilada executou `--help` sem loader TypeScript. Os testes novos usam apenas peer TDS/TLS sintético em loopback e comprovam PEM/fingerprint corretos, modo 0600, ausência de PEM no stdout, nenhuma escrita sem opção explícita, recusa de diretório inseguro/symlink/sobrescrita, colisão durante o handshake e zero bytes de aplicação/LOGIN7/SQL. Nenhuma conexão corporativa, alteração de aquisição/scheduler/Compose/PostgreSQL/WireGuard, commit, push ou deploy foi realizada nesta atualização.
 
 ## Arquivos e testes
 

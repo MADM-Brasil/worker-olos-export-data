@@ -16,7 +16,7 @@ const Debug = require('tedious/lib/debug.js') as typeof import('tedious/lib/debu
 
 export type DiagnosticCode = 'VERIFIED' | 'PIN_VERIFIED' | 'PIN_REJECTED' | 'INSPECTED_UNVERIFIED' | 'CERT_UNTRUSTED' | 'CERT_NAME_MISMATCH' |
   'CERT_EXPIRED' | 'CERT_INVALID' | 'TLS_INCOMPATIBLE' | 'TLS_NOT_SUPPORTED' | 'NETWORK_FAILURE' |
-  'TIMEOUT' | 'INVALID_TDS' | 'LIMIT_EXCEEDED' | 'UNSUPPORTED_DRIVER' | 'INVALID_CONFIGURATION';
+  'TIMEOUT' | 'INVALID_TDS' | 'LIMIT_EXCEEDED' | 'UNSUPPORTED_DRIVER' | 'INVALID_CONFIGURATION' | 'CERT_EXPORT_FAILED';
 export interface CertificateMetadata {
   subject: string;
   issuer: string;
@@ -100,7 +100,7 @@ function validate(options: TlsDiagnosticOptions): void {
   }
 }
 /** One TCP attempt, PRELOGIN + TLS only. No credentials, database, SQL or retry API. */
-export async function diagnoseTdsTls(options: TlsDiagnosticOptions): Promise<TlsDiagnosticResult> {
+export async function diagnoseTdsTls(options: TlsDiagnosticOptions, exportCertificate?: (pem: string) => Promise<void>): Promise<TlsDiagnosticResult> {
   const empty = { verified: false, chain: 'not-assessed', name: 'not-assessed' } as const;
   try { validate(options); } catch (error) { return { ...empty, code: classifyTlsError(error) }; }
   const socket = new Socket();
@@ -112,6 +112,8 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions): Promise<Tls
   let phase: 'prelogin' | 'tls' = 'prelogin';
   let timer: ReturnType<typeof setTimeout> | undefined;
   let received = 0;
+  let certificatePem: string | undefined;
+  let result: TlsDiagnosticResult;
   let abort!: (error: unknown) => void;
   const stopped = new Promise<never>((_, reject) => { abort = reject; });
   const fail = (error: unknown) => { abort(error); socket.destroy(); };
@@ -147,6 +149,7 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions): Promise<Tls
       const tls: TLSSocket | undefined = io.securePair?.cleartext;
       const cert = tls?.getPeerCertificate();
       if (!tls || !cert?.raw) throw new DiagnosticError('CERT_INVALID');
+      if (exportCertificate) certificatePem = new X509Certificate(cert.raw).toString();
       if (options.mode === 'verify-pinned') return { code: 'PIN_VERIFIED', verified: true, identity: 'certificate-sha256-pin',
         certificate: publicCertificate(cert.raw), chain: 'valid', name: checkServerIdentity(options.serverName,cert) ? 'mismatch' : 'match' };
       const matches = checkServerIdentity(options.serverName, cert) === undefined;
@@ -154,11 +157,11 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions): Promise<Tls
       return { code: options.mode === 'verify' ? 'VERIFIED' : 'INSPECTED_UNVERIFIED', verified: options.mode === 'verify',
         certificate: publicCertificate(cert.raw), chain: tls.authorized ? 'valid' : 'unverified', name: matches ? 'match' : 'mismatch' };
     };
-    return await Promise.race([work(), stopped]);
+    result = await Promise.race([work(), stopped]);
   } catch (error) {
     // OpenSSL errors have stable codes; do not expose messages/stacks, certificate dumps or wire buffers.
     const code = classifyTlsError(error);
-    return { ...empty, code: phase === 'prelogin' && code === 'TLS_INCOMPATIBLE' ? 'INVALID_TDS' : code };
+    result = { ...empty, code: phase === 'prelogin' && code === 'TLS_INCOMPATIBLE' ? 'INVALID_TDS' : code };
   } finally {
     clearTimeout(timer);
     socket.unpipe();
@@ -169,4 +172,10 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions): Promise<Tls
     io.outgoingMessageStream.destroy();
     socket.destroy();
   }
+  // Export only after the diagnostic transport is closed. PEM never enters the JSON result.
+  if (exportCertificate && certificatePem && result.certificate) {
+    try { await exportCertificate(certificatePem); }
+    catch { return { ...result, code: 'CERT_EXPORT_FAILED' }; }
+  }
+  return result;
 }
