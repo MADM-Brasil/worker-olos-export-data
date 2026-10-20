@@ -43,7 +43,7 @@ services:
           create_host_path: false
     tmpfs:
       - /tmp:size=64m,mode=1777
-    networks: [isolated]
+    networks: [isolated, olos_egress]
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,6 +87,8 @@ services:
 networks:
   isolated:
     internal: true
+  olos_egress:
+    driver: bridge
 
 volumes:
   postgres_data:
