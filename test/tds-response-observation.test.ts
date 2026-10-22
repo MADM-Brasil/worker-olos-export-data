@@ -102,3 +102,15 @@ it('observation configuration has no fictitious CurrentDay/PreviousDays contract
  expect(corporateObservationSchema.safeParse({...cfg,current:{plan:largePlan(),fields:[]}}).success).toBe(false);
  expect(()=>createCorporateResponseReplayBinding({current:{plan:largePlan(),fields:[]}} as never,{campaigns:new Map(),dispositions:new Map(),agents:new Map()},{} as never,[],'2020-06-03')).toThrow();
 });
+it('inspection disk replay drains the full message before parsing rejects unsupported metadata',async()=>{
+ const connection=new ExactConnection({server:'127.0.0.1',options:{database:'phase3d_fixture',serverName:'localhost',encrypt:true,trustServerCertificate:false,cryptoCredentialsDetails:{ca:'synthetic-unused-offline'}}});
+ const captured:Buffer[]=[];let failed=false,observedType:string|undefined;
+ const unsupported=Buffer.concat([Buffer.from([0x81]),u16(1),meta('unsupported',Buffer.from([0x32]),false),Buffer.alloc(16000,17)]);
+ connection.responseCapture=async chunk=>{captured.push(Buffer.from(chunk));};
+ connection.responseReplay=async function*(){expect(Buffer.concat(captured)).toEqual(unsupported);yield* captured;};
+ let resolveFailure!:()=>void;const failure=new Promise<void>(r=>{resolveFailure=r;});
+ connection.acquisition={metadataObserved:columns=>{observedType=columns[0]?.type.name;},fields:undefined,limits:parserLimits,token(){},fail(){failed=true;resolveFailure();}};
+ class RequestTokenHandler {}
+ connection.createTokenStreamParser(Readable.from([unsupported.subarray(0,50),unsupported.subarray(50)]) as never,new RequestTokenHandler() as never);
+ await failure;expect(failed).toBe(true);expect(observedType).toBe('Bit');expect(Buffer.concat(captured)).toEqual(unsupported);connection.close();
+});

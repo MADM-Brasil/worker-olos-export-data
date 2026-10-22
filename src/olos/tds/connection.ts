@@ -9,6 +9,7 @@ import { Readable } from 'node:stream';
 import { createRequire } from 'node:module';
 import { Connection, type Request, type ConnectionConfiguration } from 'tedious';
 type Message = InstanceType<typeof import('tedious/lib/message.js').default>;
+import type {ColumnMetadata} from 'tedious/lib/token/colmetadata-token-parser.js';
 import type { TokenHandler } from 'tedious/lib/token/handler.js';
 import type { Parser } from 'tedious/lib/token/token-stream-parser.js';
 import { ExactTokenParser, type TdsField, type RawParserLimits } from './raw-parser.js';
@@ -89,22 +90,27 @@ export class ExactConnection extends Connection {
     super.sendLogin7Packet();
   }
   override callProcedure(request: Request): void { if (this.dispositionEndpoint && isPreparedAttemptsEndpoint(this.dispositionEndpoint)) assertPreparedAttemptsRpc(request,this.dispositionEndpoint); else if (this.dispositionEndpoint) assertDispositionRpc(request,this.dispositionEndpoint); super.callProcedure(request); }
-  acquisition: { fields: readonly TdsField[] | undefined; limits: RawParserLimits; token: (value: { name: string; [key: string]: unknown }) => void; fail: () => void } | undefined;
+  acquisition: { metadataObserved?: (columns:readonly ColumnMetadata[])=>void; fields: readonly TdsField[] | undefined; limits: RawParserLimits; token: (value: { name: string; [key: string]: unknown }) => void; fail: () => void } | undefined;
   /** Request response only: LOGIN7, passwords and authentication messages never enter this sink. */
   responseCapture: ((chunk: Buffer) => Promise<void>) | undefined;
+  private responseReplayed=false;
+  responseReplay: (() => AsyncIterable<Buffer>) | undefined;
   override createTokenStreamParser(message: Message, handler: TokenHandler): Parser {
     if (version !== '18.6.2') throw new OlosError('CONTRACT_UNCONFIRMED');
     if (!this.acquisition || handler.constructor.name !== 'RequestTokenHandler') return super.createTokenStreamParser(message,handler);
     const acquisition = this.acquisition;
     const capture = this.responseCapture;
+    const replay=this.responseReplay;
+    if(replay){if(this.responseReplayed)throw new OlosError('INVALID_RESPONSE','unknown');this.responseReplayed=true;}
     async function* payload() {
       for await (const chunk of message) {
         if (!Buffer.isBuffer(chunk)) throw new OlosError('INVALID_RESPONSE','unknown');
         if (capture) await capture(chunk); // disk backpressure BEFORE parsing or lossy conversions
-        yield chunk;
+        if(!replay)yield chunk;
       }
+      if(replay)yield* replay();
     }
-    const raw = new ExactTokenParser(payload(),this.debug,this.config.options,acquisition.fields,acquisition.limits);
+    const raw = new ExactTokenParser(payload(),this.debug,this.config.options,acquisition.fields,acquisition.limits,acquisition.metadataObserved);
     const emitter = new EventEmitter();
     const parser = Readable.from(raw.tokens(),{ objectMode: true, highWaterMark: 1 });
     parser.on('data', token => {

@@ -73,7 +73,8 @@ export function observeMetadata(columns: readonly ColumnMetadata[], bounds: RawP
 export class ExactTokenParser extends StreamParser {
   private ended = false;
   constructor(iterable: AsyncIterable<Buffer> | Iterable<Buffer>, debug: Debug, options: ParserOptions,
-    private readonly fields: readonly TdsField[] | undefined, private readonly bounds: RawParserLimits = parserLimits) {
+    private readonly fields: readonly TdsField[] | undefined, private readonly bounds: RawParserLimits = parserLimits,
+    private readonly metadataObserved?: (columns:readonly ColumnMetadata[])=>void) {
     super(iterable,debug,options);
     validateParserLimits(bounds);
   }
@@ -94,7 +95,7 @@ export class ExactTokenParser extends StreamParser {
     while (this.buffer.length - this.position < 2) await this.waitForChunk();
     const count = this.buffer.readUInt16LE(this.position);
     if (!count || count > 512) fail(); // inclusive NO_METADATA: não reutilizar layout de outra resposta
-    const token = await super.readColMetadataToken(); checkMetadata(token.columns,this.fields ?? observeMetadata(token.columns,this.bounds)); return token;
+    const token = await super.readColMetadataToken(); this.metadataObserved?.(token.columns);checkMetadata(token.columns,this.fields ?? observeMetadata(token.columns,this.bounds)); return token;
   }
   private async body(m: Metadata, budget: number): Promise<Buffer | null> {
     const type = m.type.name;

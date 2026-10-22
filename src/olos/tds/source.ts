@@ -1,5 +1,5 @@
 import { canonical } from '../../persistence/validation.js';
-import { isPreparedAttemptsEndpoint, assertPreparedAttemptsCall, assertCorporateAttemptsExecution, type PreparedAttemptsEndpoint } from './attempts-access.js';
+import { isLogInspectionEndpoint, isPreparedAttemptsEndpoint, assertPreparedAttemptsCall, assertCorporateAttemptsExecution, type PreparedAttemptsEndpoint } from './attempts-access.js';
 import { isDispositionEndpoint, assertDispositionCall, type DispositionEndpoint } from './disposition-access.js';
 import { isExceptionalDispositionEndpoint } from './disposition-exception.js';
 import { TYPES, Request } from 'tedious';
@@ -58,6 +58,8 @@ export class IsolatedTdsSource {
   readonly kind: 'isolated-sqlserver' | 'controlled-disposition' | 'mssql';
   readonly metrics = { rows: 0, pauses: 0, resumes: 0, peakQueuedRows: 0, calls: 0, infoMessages: 0 };
   readonly observedMetadata: { name: string; type: string; nullable: boolean; dataLength: number | null; collationHex: string | null }[] = [];
+  readonly responseObservation: {returnValue:number|null;datasetCount:number;finalDone:boolean;sqlError:boolean;errorMessagePresent:boolean|null}={returnValue:null,datasetCount:0,finalDone:false,sqlError:false,errorMessagePresent:null};
+  readonly observedDatasets: { name: string; type: string; nullable: boolean; dataLength: number | null; collationHex: string | null }[][] = [];
   readonly observedFields: TdsField[] = [];
   readonly transportSecurity: { encrypted: true; identityValidated: boolean; protocol: string; tlsMode: 'verified' | 'exceptional-unverified-test' | 'certificate-pinned' }[] = [];
   private busy = false;
@@ -65,7 +67,9 @@ export class IsolatedTdsSource {
   private readonly fields: readonly TdsField[];
   private readonly limits: RawParserLimits;
   constructor(endpoint: IsolatedEndpoint | DispositionEndpoint | PreparedAttemptsEndpoint, fields: readonly TdsField[], limits: RawParserLimits = parserLimits,
-    private readonly capture?: (chunk: Buffer) => Promise<void>) {
+    private readonly capture?: (chunk: Buffer) => Promise<void>,
+    private readonly inspectionReplay?: () => AsyncIterable<Buffer>) {
+    if(inspectionReplay && isPreparedAttemptsEndpoint(endpoint) && !isLogInspectionEndpoint(endpoint))throw new OlosError('REAL_EXECUTION_BLOCKED');
     if (!isPreparedAttemptsEndpoint(endpoint) && !isDispositionEndpoint(endpoint) && (endpoint.server !== '127.0.0.1' || endpoint.database !== 'phase3d_fixture' || !Number.isInteger(endpoint.port) || endpoint.port < 1024 || endpoint.port > 65535 ||
       !endpoint.user || !endpoint.password || !endpoint.ca.includes('BEGIN CERTIFICATE') || !fields.length && !capture || fields.length > 512)) throw new OlosError('REAL_EXECUTION_BLOCKED');
     if (!fields.length && (!capture || isDispositionEndpoint(endpoint))) throw new OlosError('REAL_EXECUTION_BLOCKED');
@@ -83,6 +87,7 @@ export class IsolatedTdsSource {
     yield* this.call(plan.signature,plan.parameters,signal);
   }
   async *call(signature: ProcedureSignature, values: PreparedCall['values'], signal: AbortSignal, timeoutMs = 300_000): AsyncGenerator<TdsEvent> {
+    if(this.inspectionReplay && signature.procedure!=='LogReadData')throw new OlosError('PROCEDURE_BLOCKED');
     if (this.busy) throw new OlosError('BUSY');
     if (signal.aborted) throw new OlosError('ABORTED');
     let request!: Request, dispatched = false, timedOut = false, finished = false, finalDone = false;
@@ -114,22 +119,26 @@ export class IsolatedTdsSource {
     // Assinaturas atuais são conferidas antes da conexão, inclusive bloqueios Reset/DataAvailable.
     prepareTdsRequest(request,snapshot.signature,snapshot.values,timeoutMs);
     connection.responseCapture = this.capture;
-    connection.acquisition = { fields: this.fields.length ? this.fields : undefined, limits: this.limits, fail: () => fail('INVALID_RESPONSE'), token: token => {
+    if(snapshot.procedure==='LogReadData' && this.inspectionReplay)connection.responseReplay=this.inspectionReplay;
+    connection.acquisition = { metadataObserved:columns=>{
+      if(this.observedDatasets.length>=64)throw new OlosError('LIMIT_EXCEEDED','unknown');
+      const metadata=columns.map(c=>({name:c.colName,type:c.type.name,nullable:Boolean(c.flags&1),dataLength:c.dataLength??null,collationHex:c.collation?.toBuffer().toString('hex')??null}));
+      this.observedDatasets.push(metadata);this.observedMetadata.push(...metadata);this.responseObservation.datasetCount=this.observedDatasets.length;
+    },fields: this.fields.length ? this.fields : undefined, limits: this.limits, fail: () => fail('INVALID_RESPONSE'), token: token => {
       if (finalDone) throw new OlosError('INVALID_RESPONSE','unknown');
-      if (token.name === 'RETURNSTATUS') lastStatus = token.value as number;
+      if (token.name === 'RETURNSTATUS') {lastStatus = token.value as number;this.responseObservation.returnValue=lastStatus;}
       if (['DONE','DONEPROC','DONEINPROC'].includes(token.name)) {
-        if (token.sqlError || token.serverError || token.attention) fail('EXECUTION_FAILED');
-        if (token.name === 'DONEPROC' && !token.more) { finalDone = true; returnValue = lastStatus; }
+        if (token.sqlError || token.serverError || token.attention) {this.responseObservation.sqlError=true;fail('EXECUTION_FAILED');}
+        if (token.name === 'DONEPROC' && !token.more) { finalDone = true; this.responseObservation.finalDone=true;returnValue = lastStatus; }
       }
     } };
     request.on('columnMetadata',columns => {
-      if (!Array.isArray(columns) || ++datasets !== 1) { fail('INVALID_RESPONSE'); connection.cancel(); return; }
-      this.observedMetadata.push(...columns.map(c => ({ name: c.colName,type: c.type.name,nullable: Boolean(c.flags & 1),dataLength: c.dataLength ?? null,collationHex: c.collation?.toBuffer().toString('hex') ?? null })));
+      if (!Array.isArray(columns) || (++datasets !== 1 && !this.inspectionReplay)) { fail('INVALID_RESPONSE'); connection.cancel(); return; }
       this.observedFields.push(...observeMetadata(columns,this.limits));
     });
     request.on('row',(columns: { value: Buffer | null; metadata: ColumnMetadata }[]) => {
       request.pause(); this.metrics.pauses++;
-      if (slot || datasets !== 1 || ++this.metrics.rows > 200_000 || columns.some(c => c.value !== null && !Buffer.isBuffer(c.value))) {
+      if (slot || (datasets !== 1 && !this.inspectionReplay) || ++this.metrics.rows > 200_000 || columns.some(c => c.value !== null && !Buffer.isBuffer(c.value))) {
         fail('LIMIT_EXCEEDED'); connection.cancel(); return;
       }
       slot = columns.map(c => c.value); this.metrics.peakQueuedRows = Math.max(this.metrics.peakQueuedRows,1); notify();
@@ -142,6 +151,7 @@ export class IsolatedTdsSource {
         typeof value === 'string' && (Buffer.byteLength(value) > this.limits.maxCellBytes || 'length' in parameter.type && parameter.type.length !== 'max' && value.length > parameter.type.length)) {
         fail('INVALID_RESPONSE'); connection.cancel(); return;
       }
+      if(name===snapshot.signature.errorOutput)this.responseObservation.errorMessagePresent=Boolean(value);
       Object.defineProperty(output,name,{ value, enumerable: true });
     });
     connection.on('infoMessage',() => { this.metrics.infoMessages++; }); // não guardar conteúdo pessoal/mensagens em logs
@@ -167,9 +177,9 @@ export class IsolatedTdsSource {
         if (finished) break;
         await new Promise<void>(resolve => { wake = resolve; });
       }
-      if (!finalDone || returnValue === undefined || datasets !== 1 || !Object.hasOwn(output,snapshot.signature.messageOutput) || !Object.hasOwn(output,snapshot.signature.errorOutput)) throw new OlosError('INVALID_RESPONSE','unknown');
+      if (!finalDone || returnValue === undefined || (datasets !== 1 && !this.inspectionReplay) || !Object.hasOwn(output,snapshot.signature.messageOutput) || !Object.hasOwn(output,snapshot.signature.errorOutput)) throw new OlosError('INVALID_RESPONSE','unknown');
       const errorMessage = output[snapshot.signature.errorOutput]!, message = output[snapshot.signature.messageOutput]!;
-      if(isPreparedAttemptsEndpoint(e) && (returnValue!==0 || errorMessage!==null && errorMessage!=='' || message!==null && message!==''))throw new OlosError('OUTPUT_ERROR','unknown');
+      if(isPreparedAttemptsEndpoint(e) && !this.inspectionReplay && (returnValue!==0 || errorMessage!==null && errorMessage!=='' || message!==null && message!==''))throw new OlosError('OUTPUT_ERROR','unknown');
       yield { kind: 'complete', datasetCount: datasets, returnValue, errorMessage, message, output: Object.freeze(output) };
     } catch (error) {
       if (error instanceof OlosError) throw error;

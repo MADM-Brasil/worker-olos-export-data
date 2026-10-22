@@ -23,6 +23,7 @@ import {serveWorker} from '../src/main.js';
 import {digest,validDate} from '../src/persistence/validation.js';
 import type {AttemptsBinding} from '../src/integration/attempts/pipeline.js';
 import {z} from 'zod';
+import {runLogInspection} from './attempts-log-inspection.js';
 
 async function exists(path:string){try{await lstat(path);return true;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}}
 async function loadCatalog(path:string,key:'CampaignId'|'DispositionId',label:'CAMPAIGN'|'DISPOSITION'){
@@ -31,14 +32,22 @@ async function loadCatalog(path:string,key:'CampaignId'|'DispositionId',label:'C
 }
 export function parseCorporateArguments(args:readonly string[],env:NodeJS.ProcessEnv){
  const [action,...rest]=args,flags:Record<string,string>={};
- if(!action || !['once','start','recover','status'].includes(action) || env.SYNC_ENABLED!==undefined && env.SYNC_ENABLED!=='false' || env.NODE_TLS_REJECT_UNAUTHORIZED==='0')throw Error('CORPORATE_COMMAND_REJECTED');
- for(let i=0;i<rest.length;i+=2){const k=rest[i],v=rest[i+1];if(!k || !v || !['--work-dir','--config','--confirm','--interval-ms'].includes(k) || Object.hasOwn(flags,k))throw Error('CORPORATE_COMMAND_REJECTED');flags[k]=v;}
+ if(!action || !['once','start','recover','status','inspect-log'].includes(action) || env.SYNC_ENABLED!==undefined && env.SYNC_ENABLED!=='false' || env.NODE_TLS_REJECT_UNAUTHORIZED==='0')throw Error('CORPORATE_COMMAND_REJECTED');
+ for(let i=0;i<rest.length;i+=2){const k=rest[i],v=rest[i+1];if(!k || !v || !['--work-dir','--config','--confirm','--interval-ms','--date-export'].includes(k) || Object.hasOwn(flags,k))throw Error('CORPORATE_COMMAND_REJECTED');flags[k]=v;}
  const base=join(homedir(),'.local','state','olos-worker','corporate-attempts'),root=flags['--work-dir']??join(base,'first-run');
  if(!root || resolve(root)!==root || !root.startsWith(`${base}/`) || root.slice(base.length+1).includes('/'))throw Error('CORPORATE_WORK_DIR_REJECTED');
+ if(action!=='inspect-log' && flags['--confirm']==='AUTHORIZE_LOG_INSPECTION')throw Error('CORPORATE_COMMAND_REJECTED');
+ if(action==='inspect-log' && (flags['--interval-ms']!==undefined || flags['--work-dir']!==undefined))throw Error('CORPORATE_COMMAND_REJECTED');
  const intervalMs=Number(flags['--interval-ms']??'60000');if(!Number.isSafeInteger(intervalMs) || intervalMs<60000 || intervalMs>3600000)throw Error('CORPORATE_INTERVAL_REJECTED');
  // The explicit CLI action plus the existing private authorization is sufficient; old confirmations remain accepted.
- if(action!=='status' && flags['--confirm']!==undefined && flags['--confirm']!==({once:'AUTHORIZE_ONE_ATTEMPTS_CURRENT_DAY',start:'AUTHORIZE_ATTEMPTS_RECURRING',recover:'LOCAL_RECOVERY_ONLY'} as const)[action])throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
- return {action,base,root,configFile:flags['--config']??join(homedir(),'.config','olos-worker','attempts-corporate.json'),intervalMs};
+ if(action!=='status' && flags['--confirm']!==undefined && flags['--confirm']!==({once:'AUTHORIZE_ONE_ATTEMPTS_CURRENT_DAY',start:'AUTHORIZE_ATTEMPTS_RECURRING',recover:'LOCAL_RECOVERY_ONLY','inspect-log':'AUTHORIZE_LOG_INSPECTION'} as const)[action])throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
+ if (action === 'inspect-log' && flags['--confirm'] !== 'AUTHORIZE_LOG_INSPECTION')
+   throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
+ if (action === 'inspect-log' && (!flags['--date-export'] || !validDate(flags['--date-export'])))
+   throw Error('LOG_INSPECTION_DATE_REQUIRED');
+ if (action !== 'inspect-log' && flags['--date-export'] !== undefined)
+   throw Error('CORPORATE_COMMAND_REJECTED');
+ return {action,base,root,configFile:flags['--config']??join(homedir(),'.config','olos-worker','attempts-corporate.json'),intervalMs,dateExport:flags['--date-export']};
 }
 async function readCorporateConfiguration(path:string|undefined){
  if(!path)throw Error('CORPORATE_CONFIGURATION_MISSING');
@@ -131,6 +140,8 @@ export async function corporateCommand(args:readonly string[],env:NodeJS.Process
  if(action==='status'){
    process.stdout.write(`${JSON.stringify(await corporateStatus(options))}\n`);return;
  }
+ if(action==='inspect-log'){const result=await runLogInspection(options.configFile,base,options.dateExport!);process.stdout.write(`${JSON.stringify(result)}\n`);return result;}
+
  if(action==='recover'){
    await privateDirectory(root);
    if(await exists(join(root,'spool','active-capture.json')) || await exists(join(root,'replay-confirmed.json'))){await recoverObservedResponse(options);return;}
@@ -348,7 +359,7 @@ export function corporateErrorCode(error:unknown):string{
      'CORPORATE_PREPARATION_MISSING','CORPORATE_PREPARATION_INVALID','OBSERVED_CONTRACT_REQUIRES_REVIEW','PREVIOUS_CONTRACT_UNCONFIRMED',
      'CONTRACT_UNCONFIRMED','SCHEMA_NOT_READY','LEASE_LOST','COMMIT_UNKNOWN','SOURCE_INTERRUPTED','STORAGE_FAILED','DISK_FULL','QUOTA_EXCEEDED','CORRUPT','INCOMPLETE','RECOVERY_AFTER_EXPIRED_LEASE_OR_HARD_CRASH_REQUIRES_REVIEW','DELIVERY_REQUIRES_RECONCILIATION',
      'CONNECTION_FAILED','EXECUTION_FAILED','INVALID_RESPONSE','TIMEOUT','ABORTED','OUTPUT_ERROR','REAL_EXECUTION_BLOCKED',
-     'CORPORATE_COMMAND_REJECTED','CORPORATE_WORK_DIR_REJECTED','CORPORATE_AUTHORIZATION_REQUIRED','CORPORATE_INTERVAL_REJECTED','RECOVERY_REQUIRES_REVIEW']);
+     'LOG_INSPECTION_PRIVATE_AUTHORIZATION_REQUIRED','LOG_INSPECTION_DATE_MISMATCH','REMOTE_OPERATION_REQUIRES_REVIEW','LOG_INSPECTION_DATE_REQUIRED','CORPORATE_COMMAND_REJECTED','CORPORATE_WORK_DIR_REJECTED','CORPORATE_AUTHORIZATION_REQUIRED','CORPORATE_INTERVAL_REJECTED','RECOVERY_REQUIRES_REVIEW']);
    if(error instanceof Error && safe.has(error.message))return error.message;
    const code=error && typeof error==='object' && 'code' in error?error.code:undefined;
    if(typeof code==='string' && safe.has(code))return code;
@@ -357,7 +368,7 @@ export function corporateErrorCode(error:unknown):string{
    return 'CORPORATE_CONFIGURATION_OR_EXECUTION_REJECTED';
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(resolve(process.argv[1])).href){
- void corporateCommand(process.argv.slice(2),process.env).catch(error=>{
+ void corporateCommand(process.argv.slice(2),process.env).then(result=>{if(result && result.state!=='RESPONSE_SEALED')process.exitCode=1;}).catch(error=>{
    const code=corporateErrorCode(error);
    process.stderr.write(`${JSON.stringify({event:'corporate_attempts_stopped',code,retryRemote:false,reviewRequired:true})}\n`);process.exitCode=1;
  });

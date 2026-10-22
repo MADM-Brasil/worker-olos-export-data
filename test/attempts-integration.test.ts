@@ -83,7 +83,9 @@ it('CLI padrão e corporate bloqueiam antes de ler arquivos ou abrir sockets; se
     const result = await cli(args); expect(result.code).toBe(1); expect(result.output).toContain('retrySource');
   }
   expect(() => requireAttemptsFixture('corporate')).toThrow('ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED');
-  expect((await cli(['requirements'])).output).toContain('CORPORATE_ATTEMPTS_CAPABILITY_NOT_ISSUABLE');
+  const requirements=await cli(['requirements']);expect(requirements.code).toBe(0);
+  const report=JSON.parse(requirements.output);expect(report).toMatchObject({corporateReadEnabled:false,firstAcquisition:{executionAllowed:false}});
+  expect(report.firstAcquisition.missing).toContainEqual(expect.objectContaining({code:'CORPORATE_ONE_SHOT_PERMIT_NOT_ISSUED'}));
 },30000); // Four separate Node/tsx processes; harness budget, not a network/RPC timeout.
 it('aprovação é específica de operação/configuração/testId e de até 15 minutos',() => {
   const a = approval(); expect(validateApproval(a,a.testId,'read',a.configurationDigest)).toEqual(a);

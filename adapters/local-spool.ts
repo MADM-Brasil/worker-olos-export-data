@@ -223,9 +223,14 @@ export class LocalSpool implements SpoolRepository {
           return {bytes,sha256};
         } catch(e) { throw safe(e); } finally { pending=false; }
       },
-      interrupt: async () => {
+      interrupt: async (detail:Readonly<Record<string,unknown>>={}) => {
         if (!closed) { try { await file.sync(); } finally { await file.close(); closed=true; } }
-        try { await descriptor('incomplete',{}); } catch { /* durable remote intent and capture claim remain */ }
+        try {
+          const reader=await fs.open(join(dir,'response.partial'),constants.O_RDONLY|constants.O_NOFOLLOW);
+          const partialHash=createHash('sha256');let actualBytes=0;
+          try{for(;;){const b=Buffer.alloc(this.limits.bufferBytes),r=await reader.read(b,0,b.length,null);if(!r.bytesRead)break;partialHash.update(b.subarray(0,r.bytesRead));actualBytes+=r.bytesRead;}}finally{await reader.close();}
+          bytes=actualBytes;await descriptor('incomplete',{...detail,sha256:partialHash.digest('hex')});
+        } catch { /* durable remote intent and capture claim remain */ }
       },
     };
   }
