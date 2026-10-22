@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { LargePlan,RawSource } from '../../large-batch/types.js';
 import { validateLargePlan } from '../../large-batch/wire.js';
 import type { TdsField } from '../../olos/tds/raw-parser.js';
-import { IsolatedTdsSource } from '../../olos/tds/source.js';
+import { isTdsResponseReplay, IsolatedTdsSource } from '../../olos/tds/source.js';
 import { prepareCorporateAttemptsEndpoint, authorizeCorporateAttemptsOnce } from '../../olos/tds/attempts-access.js';
 import { assertOlosPinApproval,type OlosPinApproval } from '../../security/olos-certificate-pin.js';
 import { canonical,digest } from '../../persistence/validation.js';
@@ -114,4 +114,18 @@ export function createCorporateResponseReplayBinding(config:CorporateConfig,cata
   const binding:AttemptsBinding={kind:'corporate-local',destinationId:'local.olos_worker.raw.olos_calls',mappingVersion:'local-approved-16/v1',
     sourceNamespace:'olos.ExportDataV3.AttemptsRawData',profile:config.profile,catalogs,plan:()=>structuredClone(plan),source:()=>source};
   bindings.set(binding,check);return binding;
+}
+
+/** Service activation imports only a sealed LOCAL response. This factory cannot register a remote source. */
+export function createApprovedCaptureReplayBinding(plan:LargePlan,fields:readonly TdsField[],profile:import('../../offline/model.js').OfflineProfile,catalogs:Catalogs,source:RawSource):AttemptsBinding{
+ const check=()=>{
+  validateLargePlan(plan);
+  if(!isTdsResponseReplay(source) || plan.run.table!=='AttemptsRawData' ||
+   canonical(fields.map(({sqlLength:_s,collationHex:_c,unicodeMetadataPolicy:_u,...f})=>f))!==canonical(plan.fields) ||
+   canonical(plan.contract.key_fields)!=='["AttemptsRawDataID"]' || canonical(profile.columns)!==canonical(APPROVED_COLUMNS) ||
+   profile.phoneMatchKey!=='normalized' || profile.tmaPolicy!=='disabled')throw Error('OBSERVED_CONTRACT_NOT_APPROVED');
+ };
+ check();const binding:AttemptsBinding={kind:'corporate-local',deferCheckpointUntilDelivery:true,destinationId:'local.olos_worker.raw.olos_calls',
+  mappingVersion:'local-approved-16/v1',sourceNamespace:'olos.ExportDataV3.AttemptsRawData',profile,catalogs,plan:()=>structuredClone(plan),source:()=>source};
+ bindings.set(binding,check);return binding;
 }

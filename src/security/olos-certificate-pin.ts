@@ -6,7 +6,7 @@ import { z } from 'zod';
 import type { PeerCertificate } from 'node:tls';
 
 const schema = z.object({
-  version: z.literal(1), purpose: z.enum(['OLOS_TDS_TLS_METADATA_ONLY','OLOS_ATTEMPTS_TDS_ACQUISITION']),
+  version: z.literal(1), validityPolicy:z.literal('CERTIFICATE_LIFETIME').optional(), purpose: z.enum(['OLOS_TDS_TLS_METADATA_ONLY','OLOS_ATTEMPTS_TDS_ACQUISITION']),
   host: z.literal('10.196.234.11'), port: z.literal(1433), database: z.literal('ExportDataV3'),
   approvalId: z.string().min(1).max(128), approvedBy: z.string().min(1).max(128),
   approvedAt: z.string().datetime(), expiresAt: z.string().datetime(),
@@ -22,6 +22,7 @@ export function assertOlosPinApproval(approval: OlosPinApproval): void {
   if (!approvals.has(approval)) throw pinError('PIN_APPROVAL_REQUIRED');
   const now = Date.now();
   if (Date.parse(approval.approvedAt) > now || Date.parse(approval.expiresAt) <= now) throw pinError('PIN_APPROVAL_EXPIRED');
+  const cert=new X509Certificate(approval.certificatePem);if(Date.parse(cert.validFrom)>now || Date.parse(cert.validTo)<=now)throw pinError('CERT_HAS_EXPIRED');
 }
 /** Explicit approval only. Never accepts an observed fingerprint as approval. */
 export function parseOlosPinApproval(input: unknown): OlosPinApproval {
@@ -29,9 +30,10 @@ export function parseOlosPinApproval(input: unknown): OlosPinApproval {
   if (!result.success) throw pinError('PIN_APPROVAL_INVALID');
   const approval = Object.freeze(result.data);
   const start = Date.parse(approval.approvedAt), end = Date.parse(approval.expiresAt);
-  if (end <= start || end - start > 7 * 86400000) throw pinError('PIN_APPROVAL_INVALID');
+  if (end <= start || !approval.validityPolicy && end - start > 7 * 86400000) throw pinError('PIN_APPROVAL_INVALID');
   let cert: X509Certificate;
   try { cert = new X509Certificate(approval.certificatePem); } catch { throw pinError('PIN_APPROVAL_INVALID'); }
+  if(approval.validityPolicy && end>Date.parse(cert.validTo))throw pinError('PIN_APPROVAL_INVALID');
   if (!timingSafeEqual(digest(cert.raw), expected(approval.fingerprintSha256))) throw pinError('PIN_MISMATCH');
   // This mode deliberately supports only an explicitly approved self-signed leaf.
   if (cert.subject !== cert.issuer || !cert.verify(cert.publicKey)) throw pinError('PIN_APPROVAL_INVALID');

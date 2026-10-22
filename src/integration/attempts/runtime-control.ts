@@ -32,7 +32,7 @@ export class AttemptsRuntimeControl {
     this.state='running';this.blockers=[];this.runner.start();
   }
   async stop():Promise<void>{await this.runner?.stop();if(this.state!=='needs_reconciliation')this.state='stopped';}
-  snapshot(){return {state:this.state,blockers:this.blockers,armed:this.state==='running',enabled:this.state==='running' && this.lastAcquisitionAt!==null,implemented:true,intervalMs:this.intervalMs,inFlight:this.inFlight,lastAcquisitionAt:this.lastAcquisitionAt,
+  snapshot(){return {nextExecutionAt:this.runner?.nextExecutionAt??null,state:this.state,blockers:this.blockers,armed:this.state==='running',enabled:this.state==='running' && this.lastAcquisitionAt!==null,implemented:true,intervalMs:this.intervalMs,inFlight:this.inFlight,lastAcquisitionAt:this.lastAcquisitionAt,
     completedCycles:this.completedCycles,lastCycleStartedAt:this.lastStartedAt,lastCycleCompletedAt:this.lastSuccessAt,lastSuccessAt:this.lastSuccessAt,
     lastFailure:this.lastFailureAt?{at:this.lastFailureAt,code:'ACQUISITION_OR_DELIVERY_REQUIRES_RECONCILIATION'}:null,...this.counts};}
 }

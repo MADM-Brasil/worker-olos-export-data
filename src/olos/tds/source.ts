@@ -25,6 +25,8 @@ export type TdsEvent = { readonly kind: 'row'; readonly values: readonly (Uint8A
   { readonly kind: 'complete'; readonly datasetCount: number; readonly returnValue: number; readonly errorMessage: string | null;
     readonly message: string | null; readonly output: Readonly<Record<string,string | null>> };
 const registered = new WeakSet<object>();
+const localReplays=new WeakSet<object>();
+export const isTdsResponseReplay=(source:object)=>localReplays.has(source);
 export const isIsolatedTdsSource = (value: object): boolean => registered.has(value);
 export function assertRegisteredTdsExecution(value: object): void {
   if (registered.has(value)) (value as IsolatedTdsSource).assertExecutionAllowed();
@@ -70,7 +72,9 @@ export class IsolatedTdsSource {
   constructor(endpoint: IsolatedEndpoint | DispositionEndpoint | PreparedAttemptsEndpoint, fields: readonly TdsField[], limits: RawParserLimits = parserLimits,
     private readonly capture?: (chunk: Buffer) => Promise<void>,
     private readonly inspectionReplay?: () => AsyncIterable<Buffer>,
-    private readonly inspectionDiagnostics?: InspectionDiagnosticObserver) {
+    private readonly inspectionDiagnostics?: InspectionDiagnosticObserver,
+    private readonly acquisitionReplay?:()=>AsyncIterable<Buffer>) {
+    if(acquisitionReplay && (!isPreparedAttemptsEndpoint(endpoint) || isLogInspectionEndpoint(endpoint) || !capture))throw new OlosError('REAL_EXECUTION_BLOCKED');
     if(inspectionReplay && isPreparedAttemptsEndpoint(endpoint) && !isLogInspectionEndpoint(endpoint))throw new OlosError('REAL_EXECUTION_BLOCKED');
     if (!isPreparedAttemptsEndpoint(endpoint) && !isDispositionEndpoint(endpoint) && (endpoint.server !== '127.0.0.1' || endpoint.database !== 'phase3d_fixture' || !Number.isInteger(endpoint.port) || endpoint.port < 1024 || endpoint.port > 65535 ||
       !endpoint.user || !endpoint.password || !endpoint.ca.includes('BEGIN CERTIFICATE') || !fields.length && !capture || fields.length > 512)) throw new OlosError('REAL_EXECUTION_BLOCKED');
@@ -125,6 +129,7 @@ export class IsolatedTdsSource {
     prepareTdsRequest(request,snapshot.signature,snapshot.values,timeoutMs);
     connection.responseCapture = this.capture;
     if(snapshot.procedure==='LogReadData' && this.inspectionReplay)connection.responseReplay=this.inspectionReplay;
+    if(this.acquisitionReplay){if(!['ReadDataCurrentDay','ReadDataPreviousDays'].includes(snapshot.procedure))throw new OlosError('PROCEDURE_BLOCKED');connection.responseReplay=this.acquisitionReplay;}
     connection.acquisition = { metadataObserved:columns=>{
       if(this.observedDatasets.length>=64)throw new OlosError('LIMIT_EXCEEDED','unknown');
       const metadata=columns.map(c=>({name:c.colName,type:c.type.name,nullable:Boolean(c.flags&1),dataLength:c.dataLength??null,collationHex:c.collation?.toBuffer().toString('hex')??null}));
@@ -238,5 +243,5 @@ export function replayTdsResponse(fields:readonly TdsField[],chunks:()=>AsyncIte
       [...output.values()].some(v=>v!==null && v!==''))throw new OlosError('INVALID_RESPONSE');
     yield {kind:'complete',returnValue:0,errorMessage:null,datasetCount:1};
   }};
-  registered.add(source);return source;
+  registered.add(source);localReplays.add(source);return source;
 }

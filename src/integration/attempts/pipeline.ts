@@ -13,6 +13,7 @@ export interface AttemptsBinding {
   // Corporate bindings require registration by the reviewed factory; SELECT adapters remain unavailable.
   kind:'isolated-fixture'|'corporate-local';tlsVerified?:true;recoveryValidated?:true;
   plan:()=>LargePlan;source:()=>RawSource;
+  deferCheckpointUntilDelivery?:boolean;
   configurationDigest?:string;
   acquisitionScopeDigest?:string;
   beforeAcquire?:(plan:LargePlan,signal:AbortSignal)=>Promise<void>;
@@ -25,7 +26,7 @@ export function createAttemptsPipeline(ingest:Pool,project:Pool,receiver:Pool,sp
   else if(binding.kind!=='isolated-fixture' || binding.tlsVerified!==true || binding.recoveryValidated!==true)throw Error('ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED');
   if(binding.profile.tmaPolicy!=='disabled' || binding.profile.phoneMatchKey!=='normalized')throw Error('DESTINATION_MAPPING_NOT_APPROVED');
   const control=new PostgresPersistence(ingest,{leaseMs:300000});
-  const writer=new PostgresLargeBatchPersistence(ingest,limits,300000,{sourceNamespace:binding.sourceNamespace,destinationId:binding.destinationId,mappingVersion:binding.mappingVersion});
+  const writer=new PostgresLargeBatchPersistence(ingest,limits,300000,{sourceNamespace:binding.sourceNamespace,destinationId:binding.destinationId,mappingVersion:binding.mappingVersion},binding.deferCheckpointUntilDelivery===true);
   const coordinator=new LargeBatchCoordinator(control,spool,writer,limits);
   const delivery=isolatedTdsDelivery(project,receiver,binding.destinationId,binding.profile,binding.catalogs,new Date().toISOString().slice(0,-1),true);
   const empty:CycleCounts={received:0,persisted:0,duplicates:0,rejected:0};

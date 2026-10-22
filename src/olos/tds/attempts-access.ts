@@ -14,6 +14,28 @@ const schema = z.object({ server: z.literal('10.196.234.11'),port: z.literal(143
   user: z.literal('OEC'),password: z.string().min(1) }).strict();
 export type PreparedAttemptsEndpoint = Readonly<z.infer<typeof schema> & { ca: string; serverName: '10.196.234.11' }>;
 const prepared = new WeakMap<object,{ pin: OlosPinApproval; call: PreparedCall }>();
+
+/** Original inspection evidence is immutable. Only an append-only, externally evidenced technical review can clear exclusion. */
+export function blockingCorporateInspection(base:string):boolean{
+ const path=join(base,'log-inspection-active.json');if(!existsSync(path))return false;
+ const read=(file:string)=>{if(realpathSync(file)!==file)throw new OlosError('REAL_EXECUTION_BLOCKED');const fd=openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW);
+  try{const st=fstatSync(fd);if(!st.isFile() || st.uid!==process.getuid?.() || st.mode&0o077 || st.size>32768)throw new OlosError('REAL_EXECUTION_BLOCKED');return JSON.parse(readFileSync(fd,'utf8')) as Record<string,unknown>;}finally{closeSync(fd);}};
+ try{
+  const marker=read(path),clearance=read(join(base,'log-inspection-clearance.json'));
+  if(clearance.kind!=='olos-inspection-clearance/v1' || clearance.caseId!==marker.attemptId || clearance.markerDigest!==requireIntentDigest(marker) ||
+   typeof clearance.recordPath!=='string' || !clearance.recordPath.startsWith(join(base,'inspection-reconciliations')+'/'))return true;
+  const r=read(clearance.recordPath),audit=r.externalEvidence as Record<string,unknown>|null;
+  if(r.decision!=='TECHNICAL_CLEARANCE' || r.remoteOutcome!=='REMOTELY_ESTABLISHED' || !r.operator || !r.reference ||
+   typeof r.issuedAt!=='string' || !Number.isFinite(Date.parse(r.issuedAt)) || Date.parse(r.issuedAt)>Date.now() ||
+   clearance.recordDigest!==requireIntentDigest(r) || r.markerDigest!==requireIntentDigest(marker) || !audit ||
+   audit.kind!=='olos-remote-audit/v1' || audit.caseId!==marker.attemptId || audit.markerDigest!==requireIntentDigest(marker) ||
+   audit.conclusion!=='NO_UNRESOLVED_INTERFERENCE' || !audit.operator || !audit.reference || !audit.rpcAuditEvidence || !audit.consumptionImpactEvidence ||
+   r.externalEvidenceDigest!==requireIntentDigest(audit) || marker.workDir!==join(base,'log-inspections',String(marker.attemptId)))return true;
+  const source={intent:read(join(String(marker.workDir),'intent.json')),pending:read(join(String(marker.workDir),'pending.json')),result:read(join(String(marker.workDir),'result.json'))};
+  return r.sourceCaseDigest!==requireIntentDigest(source);
+ }catch{return true;}
+}
+
 interface AttemptPermit { validate: () => void; call: boolean; connection: boolean; socket: boolean; login: boolean; rpc: boolean; }
 const permits = new WeakMap<object,AttemptPermit>();
 /** Issued only AFTER the adapter fsyncs its exclusive intent. No permit for recovery RPCs. */
@@ -41,7 +63,7 @@ async function authorizeCorporateAttemptsFor(
     }finally{await f.close();}
   };
   const intent=await read(paths.intentPath),pending=await read(paths.pendingPath);
-  if(purpose==='acquisition' && existsSync(join(dirname(paths.pendingPath),'log-inspection-active.json')))throw new OlosError('REAL_EXECUTION_BLOCKED');
+  if(purpose==='acquisition' && blockingCorporateInspection(dirname(paths.pendingPath)))throw new OlosError('REAL_EXECUTION_BLOCKED');
   if(typeof intent.attemptId!=='string' || !/^[a-f0-9-]{36}$/.test(intent.attemptId) || intent.procedure!==entry.call.procedure || intent.pinApprovalId!==entry.pin.approvalId ||
     typeof intent.configurationDigest!=='string' || !/^[a-f0-9]{64}$/.test(intent.configurationDigest) ||
     typeof intent.operator!=='string' || !intent.operator || typeof intent.approvalReference!=='string' || !intent.approvalReference ||
@@ -72,7 +94,7 @@ async function authorizeCorporateAttemptsFor(
       if(typeof intent.expiresAt!=='string' || !Number.isFinite(Date.parse(intent.expiresAt)) || Date.parse(intent.expiresAt)<=Date.now())throw new OlosError('REAL_EXECUTION_BLOCKED');
     };
   }
-  if(purpose==='acquisition'){const original=validate;validate=()=>{original();if(existsSync(join(dirname(paths.pendingPath),'log-inspection-active.json')))throw new OlosError('REAL_EXECUTION_BLOCKED');};}
+  if(purpose==='acquisition'){const original=validate;validate=()=>{original();if(blockingCorporateInspection(dirname(paths.pendingPath)))throw new OlosError('REAL_EXECUTION_BLOCKED');};}
   validate();attemptsPin(endpoint);
   if(purpose==='log-inspection'){
     // Durable one-use claim: even a fresh endpoint/process cannot reuse this intent.

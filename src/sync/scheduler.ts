@@ -3,6 +3,8 @@ export class Scheduler {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private inFlight: Promise<void> | undefined;
   private stopped = true;
+  private nextAt:number|null=null;
+  get nextExecutionAt(){return this.nextAt===null?null:new Date(this.nextAt).toISOString();}
   private readonly abort = new AbortController();
 
   constructor(private readonly task: (signal: AbortSignal) => Promise<void>,
@@ -16,17 +18,19 @@ export class Scheduler {
   }
   private schedule(): void {
     if (this.stopped) return;
+    this.nextAt=Date.now()+this.intervalMs;
     this.timer = setTimeout(() => {
       this.inFlight = this.run();
     }, this.intervalMs);
   }
   private async run(): Promise<void> {
+    this.nextAt=null;
     try { await this.task(this.abort.signal); }
     catch { this.onFailure(); }
     finally { this.inFlight = undefined; this.schedule(); }
   }
   async stop(): Promise<void> {
-    this.stopped = true;
+    this.stopped = true;this.nextAt=null;
     this.abort.abort();
     clearTimeout(this.timer);
     await this.inFlight;

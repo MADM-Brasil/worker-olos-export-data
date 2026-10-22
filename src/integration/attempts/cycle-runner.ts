@@ -35,6 +35,8 @@ export class AttemptsCycleRunner {
     await this.scheduler.stop();
   }
 
+  get nextExecutionAt(){return this.scheduler.nextExecutionAt;}
+
   get status(): 'running' | 'failed' | 'stopped' {
     if (this.failed) return 'failed';
     return this.stopped ? 'stopped' : 'running';

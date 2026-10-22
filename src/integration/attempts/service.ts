@@ -17,7 +17,7 @@ export class AttemptsService implements WorkerRuntime {
   private checkedAt:string|null=null;
   private readonly abort=new AbortController();
   constructor(readonly pools:RuntimePools,private readonly intervalMs=60000,
-    private readonly authorizedCycle?: (signal:AbortSignal)=>Promise<CycleCounts>,private readonly sourceKind='isolated-fixture') {
+    private readonly authorizedCycle?: (signal:AbortSignal)=>Promise<CycleCounts>,private readonly sourceKind='isolated-fixture',private readonly operationalSnapshot?:()=>Record<string,unknown>) {
     this.control=new AttemptsRuntimeControl(intervalMs);
     this.control.block(['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]);
   }
@@ -85,10 +85,13 @@ export class AttemptsService implements WorkerRuntime {
     })();return this.starting;
   }
   ready(){const s=this.control.snapshot();return !this.stopping && !this.abort.signal.aborted && this.schemaReady && s.enabled;}
+  snapshotNextExecutionAt(){return this.control.snapshot().nextExecutionAt;}
+  snapshotDatabaseState(){return this.database;}
+  snapshotBaseArmed(){return this.control.snapshot().armed;}
   snapshot(){const totals=this.aggregates.ingestionTotals as {unresolved:string}|undefined;
     return {...this.control.snapshot(),enabled:this.ready(),countsScope:'ingestion_last_completed_cycle',sourceConfigured:Boolean(this.authorizedCycle),sourceAuthorized:Boolean(this.authorizedCycle),
     sourceKind:this.authorizedCycle?this.sourceKind:'corporate-blocked',databaseState:this.database,schemaReady:this.schemaReady,statisticsAvailable:this.schemaReady,statisticsCheckedAt:this.checkedAt,
-    recoveryPending:this.control.snapshot().state==='needs_reconciliation' || Boolean(totals && totals.unresolved!=='0') || Number(this.aggregates.pendingDeliveries)>0,...this.aggregates};}
+    recoveryPending:this.control.snapshot().state==='needs_reconciliation' || Boolean(totals && totals.unresolved!=='0') || Number(this.aggregates.pendingDeliveries)>0,...this.aggregates,...this.operationalSnapshot?.()};}
   stop():Promise<void>{this.closing ??=this.close();return this.closing;}
   private async close(){this.stopping=true;this.abort.abort();await this.starting;await this.control.stop();await this.refreshTask?.catch(()=>{});
     if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(740219,1)').catch(()=>{});this.lock.release(true);this.lock=undefined;}

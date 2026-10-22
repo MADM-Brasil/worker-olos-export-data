@@ -58,7 +58,7 @@ describe('entrega TDS isolada', () => {
   });
 });
 
-it('entrega três chamadas TDS sintéticas com recibos transacionais', async () => {
+it.each([false,true])('entrega três chamadas TDS sintéticas com recibos transacionais; checkpoint adiado=%s', async deferCheckpoint => {
   const { isolatedPostgres } = await import('./support/postgres.js');
   const { readFile } = await import('node:fs/promises');
   const pg = (await import('pg')).default;
@@ -66,6 +66,7 @@ it('entrega três chamadas TDS sintéticas com recibos transacionais', async () 
   const { destinationVersion } = await import('../src/projection/contract.js');
   const { isolatedTdsDelivery } = await import('../src/offline/tds-delivery.js');
 
+  let deliveryManifest:import('../src/large-batch/types.js').SpoolManifest|undefined;
   const source = await isolatedPostgres();
   let destination: Awaited<ReturnType<typeof isolatedPostgres>> | undefined;
   let projector: InstanceType<typeof pg.Pool> | undefined;
@@ -199,7 +200,7 @@ it('entrega três chamadas TDS sintéticas com recibos transacionais', async () 
           sourceNamespace: 'synthetic-source',
           destinationId,
           mappingVersion: 'fixture-v1',
-        },
+        },deferCheckpoint,
       );
 
       const coordinator = new LargeBatchCoordinator(
@@ -232,8 +233,13 @@ it('entrega três chamadas TDS sintéticas com recibos transacionais', async () 
       expect(counts.rows[0]).toMatchObject({
         raw_rows: 3,
         deliveries: 3,
-        checkpoint: '1',
+        checkpoint: deferCheckpoint?'0':'1',
       });
+      if(deferCheckpoint){
+        const id=(await source.admin.query('SELECT batch_id FROM olos_export.large_batch_receipts')).rows[0].batch_id;
+        deliveryManifest=JSON.parse(await readFile(join(root,'batches',id,'manifest.json'),'utf8'));
+        await expect(captured.confirmDeliveryCheckpoint(deliveryManifest!)).rejects.toThrow('RECOVERY_REQUIRED');
+      }
     } finally {
       await worker.end();
       await rm(root, { recursive: true, force: true });
@@ -271,6 +277,16 @@ it('entrega três chamadas TDS sintéticas com recibos transacionais', async () 
     );
 
     expect(columns.rows[0].total).toBe(16);
+    if(deferCheckpoint){
+      const {PostgresLargeBatchPersistence}=await import('../src/persistence/large-batch.js');
+      const {spoolLimits}=await import('../src/large-batch/config.js');const worker=source.worker();
+      try{
+        const finalizer=new PostgresLargeBatchPersistence(worker,spoolLimits(),300000,{sourceNamespace:'synthetic-source',destinationId,mappingVersion:'fixture-v1'},true);
+        await finalizer.confirmDeliveryCheckpoint(deliveryManifest!);await finalizer.confirmDeliveryCheckpoint(deliveryManifest!);
+        expect((await source.admin.query('SELECT version::text FROM olos_export.checkpoints')).rows[0].version).toBe('1');
+      }finally{await worker.end();}
+    }
+
 
   } finally {
     await projector?.end();
