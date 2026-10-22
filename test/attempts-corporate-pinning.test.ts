@@ -6,6 +6,7 @@ import { Request } from 'tedious';
 import { parseOlosPinApproval } from '../src/security/olos-certificate-pin.js';
 import { prepareCorporateAttemptsEndpoint, matchesPreparedAttemptsConnection, assertCorporateAttemptsExecution } from '../src/olos/tds/attempts-access.js';
 import { ExactConnection } from '../src/olos/tds/connection.js';
+import {InspectionDiagnostics} from '../src/olos/tds/inspection-diagnostics.js';
 import { PinnedMessageIO } from '../src/diagnostics/pinned-message-io.js';
 import { IsolatedTdsSource } from '../src/olos/tds/source.js';
 import { reportedSignature, verifiedProcedureContracts } from '../src/olos/procedure-signatures.js';
@@ -76,6 +77,7 @@ it.each([false,true])('Connection real do Tedious instala o IO existente; certif
   const c = new BeforeLogin({ server: '127.0.0.1',authentication: { type: 'default',options: { userName: 'synthetic',password: 'synthetic' } },
     options: { port: server.port,database: 'phase3d_fixture',serverName: 'localhost',encrypt: true,trustServerCertificate: false,connectTimeout: 1500,
       maxRetriesOnTransientErrors: 0,cryptoCredentialsDetails: { ca: certs.selfSigned,minVersion: 'TLSv1.2',maxVersion: 'TLSv1.2' } } },undefined,pin());
+  const diagnostics=new InspectionDiagnostics();c.inspectionDiagnostics=diagnostics.observe;
   c.on('secure',tls => { secured = tls.authorized && tls.getProtocol() === 'TLSv1.2'; }); c.on('error',() => {});
   try {
     await new Promise<void>((resolve,reject) => {
@@ -83,6 +85,9 @@ it.each([false,true])('Connection real do Tedious instala o IO existente; certif
       c.once('end',() => { clearTimeout(timeout); resolve(); }); c.connect(() => {});
     });
     expect(c.messageIo).toBeInstanceOf(PinnedMessageIO);
+    expect(diagnostics.snapshot().observedStages).toContain('TLS_HANDSHAKE_STARTED');
+    if(substitute)expect(diagnostics.snapshot()).toMatchObject({phase:'TLS_HANDSHAKE',rpcDispatchState:'NOT_OBSERVED'});
+    else expect(diagnostics.snapshot().observedStages).toContain('TLS_VALIDATED');
     expect(loginReached).toBe(!substitute); expect(secured).toBe(!substitute);
     expect(server.sessions).toHaveLength(1); expect(server.sessions[0]?.applicationBytes).toBe(0);
     expect(server.sessions[0]?.types.every(t => t === 0x12)).toBe(true);

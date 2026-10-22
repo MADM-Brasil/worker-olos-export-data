@@ -10,6 +10,7 @@ import {prepareCorporateAttemptsEndpoint,authorizeCorporateLogInspection} from '
 import {reportedSignature} from '../src/olos/procedure-signatures.js';
 import {IsolatedTdsSource} from '../src/olos/tds/source.js';
 import {parserLimits} from '../src/olos/tds/raw-parser.js';
+import {InspectionDiagnostics,reportInspectionFailure} from '../src/olos/tds/inspection-diagnostics.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 
 const authorizationSchema=z.object({scope:z.literal('OLOS_LOGREADDATA_INSPECTION_ONLY'),operationId:z.string().uuid(),
@@ -61,9 +62,11 @@ export async function executeLogInspection(configInput:unknown,pin:OlosPinApprov
   const prepared=await prepareLogInspection(base,config,pin,dateExport);
   const {attemptId,workDir,capture}=prepared,abort=new AbortController(),cancel=()=>abort.abort();
   let rawComplete=false,source:IsolatedTdsSource|undefined,received=0,completion:Record<string,unknown>|undefined;
+  const diagnostics=new InspectionDiagnostics();
   let status='REMOTE_OUTCOME_UNKNOWN',failure=false;
   process.once('SIGINT',cancel);process.once('SIGTERM',cancel);
   try{
+    await durableExclusive(join(workDir,'diagnostic-start.json'),{attemptId,...diagnostics.snapshot()});
     await authorizeCorporateLogInspection(endpoint,()=>{
       validate(config,pin,dateExport);
       if(existsSync(join(base,'remote-pending.json')))throw Error('REMOTE_OPERATION_REQUIRES_REVIEW');
@@ -72,34 +75,49 @@ export async function executeLogInspection(configInput:unknown,pin:OlosPinApprov
         digest(JSON.parse(readFileSync(fd,'utf8')))!==digest({attemptId,workDir,configurationDigest:prepared.intent.configurationDigest}))throw Error('REMOTE_OPERATION_REQUIRES_REVIEW');}finally{closeSync(fd);}
       if(abort.signal.aborted)throw Error('ABORTED');},
       async()=>({intentPath:prepared.intentPath,pendingPath:prepared.pendingPath}),prepared.intent);
+    diagnostics.observe({kind:'stage',stage:'PERMIT_ISSUED'});
     // Durable conservative marker BEFORE any socket. Survives SIGKILL and ambiguous dispatch failures.
     await durableExclusive(join(workDir,'remote-outcome-unknown.json'),{attemptId,state:'REMOTE_OUTCOME_UNKNOWN',retryRemote:false});
     async function* replay(){
       // Called only after the complete TDS response message has reached the capture sink.
-      rawComplete=true;
+      rawComplete=true;diagnostics.observe({kind:'stage',stage:'RESPONSE_VALIDATION_STARTED'});
       const f=await open(join(workDir,'spool','batches',attemptId,'response.partial'),constants.O_RDONLY|constants.O_NOFOLLOW);
       try{for(;;){const b=Buffer.alloc(65536),r=await f.read(b,0,b.length,null);if(!r.bytesRead)break;yield b.subarray(0,r.bytesRead);}}finally{await f.close();}
     }
-    source=makeSource(endpoint,[],parserLimits,chunk=>capture.append(chunk),replay);
+    diagnostics.observe({kind:'stage',stage:'CONNECTION_INIT_STARTED'});
+    source=makeSource(endpoint,[],parserLimits,async chunk=>{
+      diagnostics.observe({kind:'stage',stage:'RESPONSE_CAPTURE_STARTED'});
+      try{await capture.append(chunk);}catch(error){reportInspectionFailure(diagnostics.observe,error,'STORAGE_FAILED');throw error;}
+    },replay,diagnostics.observe);
     for await(const event of source.call(signature,values,abort.signal)){
       if(event.kind==='row')received++;
       else completion={returnValue:event.returnValue,datasetCount:event.datasetCount,errorMessagePresent:Boolean(event.errorMessage),messagePresent:Boolean(event.message)};
     }
     if(!completion || !rawComplete)throw Error('INCOMPLETE');
+    diagnostics.observe({kind:'stage',stage:'RESPONSE_VALIDATED'});
+    if(completion.returnValue!==0 || completion.errorMessagePresent)reportInspectionFailure(diagnostics.observe,new Error('OUTPUT_ERROR'));
     status=completion.returnValue===0 && !completion.errorMessagePresent?'RESPONSE_SEALED':'REVIEW_REQUIRED';
-  }catch{failure=true;}
+  }catch(error){failure=true;reportInspectionFailure(diagnostics.observe,error);}
   finally{process.removeListener('SIGINT',cancel);process.removeListener('SIGTERM',cancel);abort.abort();}
   // Even unsupported metadata/SQL errors retain the entire received message for private human review.
   const detail={received:completion?received:null,parsedRows:received,fields:source?.observedFields??[],metadata:source?.observedMetadata??[],
     datasets:source?.observedDatasets??[],transportSecurity:source?.transportSecurity??[],completion:completion??null,observedOutcome:source?.responseObservation??null,state:status,
     rawMessageComplete:rawComplete,responseValidated:!failure,reviewRequired:true,rangeAttribution:'REMOTE_RANGE_ATTRIBUTION_NOT_ESTABLISHED'};
   let sealed:{sha256:string;bytes:number}|undefined;
-  if(rawComplete)sealed=await capture.seal(detail);
-  else await capture.interrupt(detail);
+  try{
+    if(!failure)diagnostics.observe({kind:'stage',stage:'CAPTURE_FINALIZATION_STARTED'});
+    if(rawComplete)sealed=await capture.seal(detail);
+    else await capture.interrupt(detail);
+  }catch(error){
+    failure=true;reportInspectionFailure(diagnostics.observe,error,'STORAGE_FAILED');
+    await capture.interrupt(detail).catch(()=>{}); // Close/preserve only; never retry RPC or sealing.
+  }
+  const diagnostic={attemptId,...diagnostics.snapshot()};
+  await durableExclusive(join(workDir,'diagnostic.json'),diagnostic);
   const result={event:'corporate_log_inspection_requires_review',attemptId,dateExport,state:failure?(rawComplete?'REVIEW_REQUIRED':'REMOTE_OUTCOME_UNKNOWN'):status,
     responseComplete:!failure && Boolean(completion),rawMessageComplete:rawComplete,responseValidated:!failure,received:completion?received:null,datasetCount:source?.responseObservation.datasetCount??null,
     returnValue:source?.responseObservation.returnValue??null,...sealed,persisted:0,checkpointAdvanced:false,retryRemote:false,reviewRequired:true,
-    rangeAttribution:'REMOTE_RANGE_ATTRIBUTION_NOT_ESTABLISHED'};
+    rangeAttribution:'REMOTE_RANGE_ATTRIBUTION_NOT_ESTABLISHED',diagnostic};
   await durableExclusive(join(workDir,'result.json'),result);
   return result;
 }

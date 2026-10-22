@@ -1,3 +1,4 @@
+import {reportInspectionFailure,type InspectionDiagnosticObserver} from './inspection-diagnostics.js';
 import { canonical } from '../../persistence/validation.js';
 import { isLogInspectionEndpoint, isPreparedAttemptsEndpoint, assertPreparedAttemptsCall, assertCorporateAttemptsExecution, type PreparedAttemptsEndpoint } from './attempts-access.js';
 import { isDispositionEndpoint, assertDispositionCall, type DispositionEndpoint } from './disposition-access.js';
@@ -68,7 +69,8 @@ export class IsolatedTdsSource {
   private readonly limits: RawParserLimits;
   constructor(endpoint: IsolatedEndpoint | DispositionEndpoint | PreparedAttemptsEndpoint, fields: readonly TdsField[], limits: RawParserLimits = parserLimits,
     private readonly capture?: (chunk: Buffer) => Promise<void>,
-    private readonly inspectionReplay?: () => AsyncIterable<Buffer>) {
+    private readonly inspectionReplay?: () => AsyncIterable<Buffer>,
+    private readonly inspectionDiagnostics?: InspectionDiagnosticObserver) {
     if(inspectionReplay && isPreparedAttemptsEndpoint(endpoint) && !isLogInspectionEndpoint(endpoint))throw new OlosError('REAL_EXECUTION_BLOCKED');
     if (!isPreparedAttemptsEndpoint(endpoint) && !isDispositionEndpoint(endpoint) && (endpoint.server !== '127.0.0.1' || endpoint.database !== 'phase3d_fixture' || !Number.isInteger(endpoint.port) || endpoint.port < 1024 || endpoint.port > 65535 ||
       !endpoint.user || !endpoint.password || !endpoint.ca.includes('BEGIN CERTIFICATE') || !fields.length && !capture || fields.length > 512)) throw new OlosError('REAL_EXECUTION_BLOCKED');
@@ -97,15 +99,17 @@ export class IsolatedTdsSource {
     const e = this.endpoint;
     if (isPreparedAttemptsEndpoint(e)) assertPreparedAttemptsCall(e,snapshot);
     if (isDispositionEndpoint(e)) assertDispositionCall(e,snapshot.procedure,snapshot.values);
+    this.inspectionDiagnostics?.({kind:'stage',stage:'CONNECTION_INIT_STARTED'});
     const connection = new ExactConnection({ server: e.server, authentication: { type: 'default', options: { userName: e.user, password: e.password } },
       options: { database: e.database, port: e.port, serverName: 'serverName' in e ? e.serverName : 'localhost', encrypt: true, trustServerCertificate: isExceptionalDispositionEndpoint(e),
         cryptoCredentialsDetails: isPreparedAttemptsEndpoint(e) ? { minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' } : { ca: e.ca, minVersion: 'TLSv1.2' }, tdsVersion: '7_4', useUTC: true,
         maxRetriesOnTransientErrors: 0, connectTimeout: 10000, requestTimeout: timeoutMs, cancelTimeout: 3000, packetSize: 4096,
         useColumnNames: false, rowCollectionOnDone: false, rowCollectionOnRequestCompletion: false } },isPreparedAttemptsEndpoint(e) ? e : isDispositionEndpoint(e) ? e as DispositionEndpoint : undefined);
+    connection.inspectionDiagnostics=this.inspectionDiagnostics;
     let closed = false;
     const end = new Promise<void>(resolve => connection.once('end',() => { closed = true; resolve(); }));
     const notify = () => { wake?.(); wake = undefined; };
-    const fail = (code: OlosError['code']) => { failure ??= new OlosError(code,dispatched ? 'unknown' : 'not_sent'); notify(); };
+    const fail = (code: OlosError['code']) => { reportInspectionFailure(this.inspectionDiagnostics,new OlosError(code));failure ??= new OlosError(code,dispatched ? 'unknown' : 'not_sent'); notify(); };
     const cancel = () => { fail(timedOut ? 'TIMEOUT' : 'ABORTED'); if (dispatched) connection.cancel(); else connection.close(); };
     connection.on('secure',tls => {
       const exceptional = isExceptionalDispositionEndpoint(e), protocol = tls.getProtocol();
@@ -113,6 +117,7 @@ export class IsolatedTdsSource {
       this.transportSecurity.push({ encrypted: true,identityValidated: !exceptional && tls.authorized,protocol: protocol!,tlsMode: exceptional ? 'exceptional-unverified-test' : isPreparedAttemptsEndpoint(e) ? 'certificate-pinned' : 'verified' });
     });
     request = new Request(procedures[snapshot.procedure],error => {
+      if(error)reportInspectionFailure(this.inspectionDiagnostics,error,timedOut?'TIMEOUT':signal.aborted?'ABORTED':'EXECUTION_FAILED');
       if (error) fail(timedOut ? 'TIMEOUT' : signal.aborted ? 'ABORTED' : 'EXECUTION_FAILED');
       finished = true; notify();
     });
@@ -155,16 +160,17 @@ export class IsolatedTdsSource {
       Object.defineProperty(output,name,{ value, enumerable: true });
     });
     connection.on('infoMessage',() => { this.metrics.infoMessages++; }); // não guardar conteúdo pessoal/mensagens em logs
-    connection.on('error',() => { fail('CONNECTION_FAILED'); finished = true; notify(); });
+    connection.on('error',error => { reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');fail('CONNECTION_FAILED'); finished = true; notify(); });
     connection.once('end',() => { if (!finished) fail('EXECUTION_FAILED'); finished = true; notify(); });
     this.busy = true;
     signal.addEventListener('abort',cancel,{ once: true });
     const timer = setTimeout(() => { timedOut = true; cancel(); },timeoutMs);
     try {
-      await new Promise<void>((resolve,reject) => { connection.connect(error => error ? reject(new OlosError('CONNECTION_FAILED')) : resolve()); });
+      await new Promise<void>((resolve,reject) => { connection.connect(error => {if(error){reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');reject(new OlosError('CONNECTION_FAILED'));}else{this.inspectionDiagnostics?.({kind:'stage',stage:'SQL_LOGIN_ACCEPTED'});resolve();}}); });
       if ((isExceptionalDispositionEndpoint(e) || isPreparedAttemptsEndpoint(e)) && this.transportSecurity.length !== 1) throw new OlosError('CONNECTION_FAILED');
       if (failure || signal.aborted) throw failure ?? new OlosError('ABORTED');
       this.metrics.rows = 0; this.observedMetadata.length = 0; this.observedFields.length = 0; this.metrics.calls++; dispatched = true;
+      this.inspectionDiagnostics?.({kind:'stage',stage:'RPC_DISPATCH_STARTED'});
       connection.callProcedure(request);
       while (true) {
         if (failure) throw failure;
@@ -182,6 +188,7 @@ export class IsolatedTdsSource {
       if(isPreparedAttemptsEndpoint(e) && !this.inspectionReplay && (returnValue!==0 || errorMessage!==null && errorMessage!=='' || message!==null && message!==''))throw new OlosError('OUTPUT_ERROR','unknown');
       yield { kind: 'complete', datasetCount: datasets, returnValue, errorMessage, message, output: Object.freeze(output) };
     } catch (error) {
+      reportInspectionFailure(this.inspectionDiagnostics,error);
       if (error instanceof OlosError) throw error;
       throw new OlosError('EXECUTION_FAILED',dispatched ? 'unknown' : 'not_sent');
     } finally {

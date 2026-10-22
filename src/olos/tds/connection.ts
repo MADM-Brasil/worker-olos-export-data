@@ -13,10 +13,12 @@ import type {ColumnMetadata} from 'tedious/lib/token/colmetadata-token-parser.js
 import type { TokenHandler } from 'tedious/lib/token/handler.js';
 import type { Parser } from 'tedious/lib/token/token-stream-parser.js';
 import { ExactTokenParser, type TdsField, type RawParserLimits } from './raw-parser.js';
+import {reportInspectionFailure,type InspectionDiagnosticObserver} from './inspection-diagnostics.js';
 import { OlosError } from '../types.js';
 
 const version = createRequire(import.meta.url)('tedious/package.json').version as string;
 export class ExactConnection extends Connection {
+  inspectionDiagnostics:InspectionDiagnosticObserver|undefined;
   private exceptionalConnectUsed = false;
   constructor(config: ConnectionConfiguration, private readonly dispositionEndpoint?: DispositionEndpoint | PreparedAttemptsEndpoint, private readonly fixturePin?: OlosPinApproval) {
     if (version !== '18.6.2') throw new OlosError('CONTRACT_UNCONFIRMED');
@@ -56,6 +58,7 @@ export class ExactConnection extends Connection {
     super.connectOnPort(port,multiSubnetFailover,signal,connector);
   }
   override socketHandlingForSendPreLogin(socket: Socket): void {
+    this.inspectionDiagnostics?.({kind:'stage',stage:'SOCKET_CONNECTED'});
     const corporate = this.dispositionEndpoint && isPreparedAttemptsEndpoint(this.dispositionEndpoint) ? this.dispositionEndpoint : undefined;
     const pin = corporate ? attemptsPin(corporate) : this.fixturePin;
     if (!pin) return super.socketHandlingForSendPreLogin(socket);
@@ -64,12 +67,14 @@ export class ExactConnection extends Connection {
     socket.on('error',error => this.socketError(error));
     socket.on('close',() => this.socketClose()); socket.on('end',() => this.socketEnd());
     socket.setKeepAlive(true,30000);
-    this.messageIo = new PinnedMessageIO(socket,this.config.options.packetSize,this.debug,pin);
+    const io=new PinnedMessageIO(socket,this.config.options.packetSize,this.debug,pin);
+    io.inspectionDiagnostics=this.inspectionDiagnostics;this.messageIo=io;
     this.messageIo.on('secure',tls => this.emit('secure',tls));
     this.socket = socket; this.closed = false;
     this.sendPreLogin(); this.transitionTo(this.STATE.SENT_PRELOGIN);
   }
   override sendLogin7Packet(): void {
+    this.inspectionDiagnostics?.({kind:'stage',stage:'SQL_LOGIN_PREPARATION'});
     const corporate = this.dispositionEndpoint && isPreparedAttemptsEndpoint(this.dispositionEndpoint) ? this.dispositionEndpoint : undefined;
     if (corporate) {
       assertCorporateAttemptsExecution(corporate);
@@ -87,9 +92,19 @@ export class ExactConnection extends Connection {
       (!this.messageIo.tlsNegotiationComplete || !['TLSv1.2','TLSv1.3'].includes(this.messageIo.securePair?.cleartext.getProtocol() ?? ''))) {
       this.emit('connect',new OlosError('REAL_EXECUTION_BLOCKED')); this.close(); return;
     }
+    this.inspectionDiagnostics?.({kind:'stage',stage:'SQL_LOGIN_STARTED'});
     super.sendLogin7Packet();
   }
-  override callProcedure(request: Request): void { if (this.dispositionEndpoint && isPreparedAttemptsEndpoint(this.dispositionEndpoint)) assertPreparedAttemptsRpc(request,this.dispositionEndpoint); else if (this.dispositionEndpoint) assertDispositionRpc(request,this.dispositionEndpoint); super.callProcedure(request); }
+  override callProcedure(request: Request): void {
+    try{
+      if (this.dispositionEndpoint && isPreparedAttemptsEndpoint(this.dispositionEndpoint)) assertPreparedAttemptsRpc(request,this.dispositionEndpoint);
+      else if (this.dispositionEndpoint) assertDispositionRpc(request,this.dispositionEndpoint);
+      this.inspectionDiagnostics?.({kind:'stage',stage:'RPC_HANDOFF_STARTED'});
+      super.callProcedure(request); // Handoff may send bytes; return is NOT a server receipt.
+      this.inspectionDiagnostics?.({kind:'stage',stage:'RPC_HANDOFF_RETURNED'});
+    }catch(error){reportInspectionFailure(this.inspectionDiagnostics,error);throw error;}
+  }
+
   acquisition: { metadataObserved?: (columns:readonly ColumnMetadata[])=>void; fields: readonly TdsField[] | undefined; limits: RawParserLimits; token: (value: { name: string; [key: string]: unknown }) => void; fail: () => void } | undefined;
   /** Request response only: LOGIN7, passwords and authentication messages never enter this sink. */
   responseCapture: ((chunk: Buffer) => Promise<void>) | undefined;

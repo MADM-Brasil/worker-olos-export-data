@@ -3,6 +3,9 @@ import {mkdtemp,rm,readFile,writeFile,chmod,stat,readdir} from 'node:fs/promises
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID,X509Certificate,createHash} from 'node:crypto';
+import * as access from '../src/olos/tds/attempts-access.js';
+import {InspectionDiagnostics,inspectionErrorCode,reportInspectionFailure} from '../src/olos/tds/inspection-diagnostics.js';
+import {OlosError} from '../src/olos/types.js';
 import {Socket} from 'node:net';
 import {Request} from 'tedious';
 import {Pool} from 'pg';
@@ -198,4 +201,107 @@ it('storage reservation failure grants no execution permission and preserves pre
  const connect=vi.spyOn(ExactConnection.prototype,'connect');
  await expect(executeLogInspection(cfg,pin,root,values.DateExport)).rejects.toThrow('DISK_FULL');
  expect(connect).not.toHaveBeenCalled();await stat(join(root,'log-inspections',cfg.authorization.operationId,'intent.json'));
+});
+
+it.each(['authorization','connection','tls','login','rpc-guard','rpc-handoff','rpc-timeout','capture','validation','seal'] as const)('durable sanitized diagnostic for %s failure without remote retry',async mode=>{
+ const secret='PRIVATE password SQL text token payload person';
+ const native=(code:string)=>Object.assign(Error(secret),{code});
+ const rpc=vi.spyOn(ExactConnection.prototype,'callProcedure');
+ if(mode==='capture' || mode==='seal'){
+  const {LocalSpool}=await import('../adapters/local-spool.js'),create=LocalSpool.prototype.createResponseCapture;
+  vi.spyOn(LocalSpool.prototype,'createResponseCapture').mockImplementation(async function(this:import('../adapters/local-spool.js').LocalSpool,id){
+   const capture=await create.call(this,id);
+   return {...capture,...(mode==='capture'?{append:async(chunk:Buffer)=>{await capture.append(chunk);throw native('ENOSPC');}}:{seal:async()=>{throw native('ENOSPC');}})};
+  });
+ }
+ if(mode==='authorization')vi.spyOn(access,'authorizeCorporateLogInspection').mockRejectedValueOnce(new OlosError('REAL_EXECUTION_BLOCKED'));
+ const connect=vi.spyOn(ExactConnection.prototype,'connect').mockImplementation(function(this:ExactConnection,cb){
+  if(mode==='connection'){cb?.(native('ECONNREFUSED'));return;}
+  this.inspectionDiagnostics?.({kind:'stage',stage:'TLS_HANDSHAKE_STARTED'});
+  if(mode==='tls'){
+   reportInspectionFailure(this.inspectionDiagnostics,native('PIN_MISMATCH'),'CONNECTION_FAILED');
+   cb?.(native('ESOCKET'));return;
+  }
+  this.inspectionDiagnostics?.({kind:'stage',stage:'TLS_VALIDATED'});
+  this.emit('secure',{authorized:true,getProtocol:()=> 'TLSv1.2'} as import('node:tls').TLSSocket);
+  this.inspectionDiagnostics?.({kind:'stage',stage:'SQL_LOGIN_STARTED'});
+  if(mode==='login'){cb?.(native('ELOGIN'));return;}cb?.();
+ });
+ rpc.mockImplementation(function(this:ExactConnection,request){
+  if(mode==='rpc-guard')throw new OlosError('PROCEDURE_BLOCKED');
+  this.inspectionDiagnostics?.({kind:'stage',stage:'RPC_HANDOFF_STARTED'});
+  if(mode==='rpc-handoff'){this.emit('error',native('ECONNRESET'));return;}
+  // Keep this branch unused: capture/validation below exercise the source callback seam.
+  request.callback(native('TIMEOUT'));
+ });
+ const result=await executeLogInspection(cfg,pin,root,values.DateExport,(...args)=>{
+  const source=new IsolatedTdsSource(...args);
+  if(mode==='capture' || mode==='validation' || mode==='seal')vi.spyOn(source,'call').mockImplementation(async function*(){
+   args[5]?.({kind:'stage',stage:'RPC_HANDOFF_STARTED'});
+   await args[3]!(Buffer.from('SYNTHETIC-PARTIAL-RESPONSE'));
+   for await(const _ of args[4]!()){}
+   if(mode==='validation')throw new OlosError('INVALID_RESPONSE','unknown');
+   yield {kind:'complete',datasetCount:0,returnValue:0,errorMessage:null,message:null,output:{Message:null,ErrorMessage:null}};
+  });return source;
+ });
+ const expected={
+  authorization:['AUTHORIZATION','AUTHORIZATION_STARTED','REAL_EXECUTION_BLOCKED','NOT_OBSERVED','NOT_OBSERVED'],
+  connection:['CONNECTION_INIT','CONNECTION_INIT_STARTED','ECONNREFUSED','NOT_OBSERVED','NOT_OBSERVED'],
+  tls:['TLS_HANDSHAKE','TLS_HANDSHAKE_STARTED','PIN_MISMATCH','NOT_OBSERVED','NOT_OBSERVED'],
+  login:['SQL_LOGIN','SQL_LOGIN_STARTED','ELOGIN','NOT_OBSERVED','NOT_OBSERVED'],
+  'rpc-guard':['RPC_DISPATCH','RPC_DISPATCH_STARTED','PROCEDURE_BLOCKED','NOT_OBSERVED','NOT_OBSERVED'],
+  'rpc-handoff':['RPC_DISPATCH','RPC_HANDOFF_STARTED','ECONNRESET','DRIVER_HANDOFF_STARTED','UNKNOWN'],
+  'rpc-timeout':['RPC_DISPATCH','RPC_HANDOFF_STARTED','TIMEOUT','DRIVER_HANDOFF_STARTED','UNKNOWN'],
+  seal:['RESPONSE_CAPTURE','CAPTURE_FINALIZATION_STARTED','ENOSPC','DRIVER_HANDOFF_STARTED','RESPONSE_VALIDATED'],
+  capture:['RESPONSE_CAPTURE','RESPONSE_CAPTURE_STARTED','ENOSPC','DRIVER_HANDOFF_STARTED','UNKNOWN'],
+  validation:['RESPONSE_VALIDATION','RESPONSE_VALIDATION_STARTED','INVALID_RESPONSE','DRIVER_HANDOFF_STARTED','UNKNOWN'],
+ }[mode]!;
+ expect(result.diagnostic).toMatchObject({phase:expected[0],lastObservedStage:expected[1],errorCode:expected[2],rpcDispatchState:expected[3],remoteExecutionOutcome:expected[4]});
+ const work=join(root,'log-inspections',cfg.authorization.operationId),path=join(work,'diagnostic.json');
+ const serialized=await readFile(path,'utf8');expect(JSON.parse(serialized)).toEqual(result.diagnostic);
+ expect(serialized).not.toContain(secret);expect(serialized).not.toMatch(/password|stack|cause|payload|person/);
+ expect((await stat(path)).mode&0o777).toBe(0o600);
+ expect((await stat(join(work,'diagnostic-start.json'))).mode&0o777).toBe(0o600);
+ expect(connect.mock.calls.length).toBeLessThanOrEqual(1);expect(rpc.mock.calls.length).toBeLessThanOrEqual(1);
+ await stat(join(root,'log-inspection-active.json'));
+ await expect(executeLogInspection(cfg,pin,root,values.DateExport)).rejects.toThrow();
+});
+it('error allowlist never emits raw messages, nested metadata or an unrecognized code',()=>{
+ for(const error of [Error('private SQL password'),{code:'PRIVATE_TOKEN',message:'PIN_MISMATCH including sensitive text',stack:'private'},
+  {message:'private',cause:{code:'untrusted private code',payload:'secret'}}])expect(inspectionErrorCode(error)).toBe('EXECUTION_FAILED');
+ expect(inspectionErrorCode({code:'ESOCKET',message:'private',cause:{code:'PIN_MISMATCH'}})).toBe('ESOCKET');
+ expect(inspectionErrorCode({cause:{code:'PIN_MISMATCH',message:'private'}})).toBe('PIN_MISMATCH');
+ const tracker=new InspectionDiagnostics();tracker.observe({kind:'stage',stage:'TLS_HANDSHAKE_STARTED'});
+ reportInspectionFailure(tracker.observe,{code:'PIN_MISMATCH',message:'private'});
+ tracker.observe({kind:'stage',stage:'SQL_LOGIN_ACCEPTED'});reportInspectionFailure(tracker.observe,new OlosError('CONNECTION_FAILED'));
+ expect(tracker.snapshot()).toMatchObject({phase:'TLS_HANDSHAKE',lastObservedStage:'TLS_HANDSHAKE_STARTED',errorCode:'PIN_MISMATCH',rpcDispatchState:'NOT_OBSERVED'});
+});
+it('does not backfill diagnostics or change any existing operation evidence',async()=>{
+ const {mkdir}=await import('node:fs/promises');
+ cfg.authorization.operationId='193c7869-6ba0-480f-a7c8-3fcd6e178394';
+ const work=join(root,'log-inspections',cfg.authorization.operationId);await mkdir(work,{recursive:true,mode:0o700});
+ const files=['intent.json','pending.json','result.json','response.partial'];
+ for(const file of files)await writeFile(join(work,file),`synthetic existing evidence: ${file}`,{mode:0o600});
+ await expect(executeLogInspection(cfg,pin,root,values.DateExport)).rejects.toMatchObject({code:'EEXIST'});
+ for(const file of files)expect(await readFile(join(work,file),'utf8')).toBe(`synthetic existing evidence: ${file}`);
+ expect((await readdir(work)).sort()).toEqual(files.sort());
+});
+
+it.each([false,true])('ExactConnection records RPC handoff only after the actual guard; guard passes=%s',async accepted=>{
+ const {ep,p,authorize}=await prepared();await authorize();
+ assertPreparedAttemptsCall(ep,prepareCall(signature,values,300000));claimAttemptsConnection(ep);claimAttemptsSocket(ep);claimAttemptsLogin(ep);
+ const connection=new ExactConnection({server:endpointConfig.server,authentication:{type:'default',options:{userName:'OEC',password:endpointConfig.password}},
+  options:{database:'ExportDataV3',port:1433,serverName:endpointConfig.server,encrypt:true,trustServerCertificate:false,tdsVersion:'7_4',useUTC:true,
+   maxRetriesOnTransientErrors:0,cryptoCredentialsDetails:{minVersion:'TLSv1.2',maxVersion:'TLSv1.2'}}},ep);
+ const diagnostics=new InspectionDiagnostics();diagnostics.observe({kind:'stage',stage:'RPC_DISPATCH_STARTED'});connection.inspectionDiagnostics=diagnostics.observe;
+ const {Connection}=await import('tedious');
+ const handoff=vi.spyOn(Connection.prototype,'callProcedure').mockImplementation(()=>{throw new OlosError('TIMEOUT','unknown');});
+ const request=new Request(`dbo.usp_ExportData_${accepted?'LogReadData':'ReReadData'}`,()=>{});prepareTdsRequest(request,signature,values,300000);
+ try{
+  expect(()=>connection.callProcedure(request)).toThrow(accepted?'TIMEOUT':'PROCEDURE_BLOCKED');
+  expect(handoff).toHaveBeenCalledTimes(accepted?1:0);
+  expect(diagnostics.snapshot()).toMatchObject({lastObservedStage:accepted?'RPC_HANDOFF_STARTED':'RPC_DISPATCH_STARTED',
+   rpcDispatchState:accepted?'DRIVER_HANDOFF_STARTED':'NOT_OBSERVED',remoteExecutionOutcome:accepted?'UNKNOWN':'NOT_OBSERVED'});
+  if(accepted){expect(()=>connection.callProcedure(request)).toThrow();expect(handoff).toHaveBeenCalledTimes(1);}
+ }finally{await p.capture.interrupt();connection.close();}
 });

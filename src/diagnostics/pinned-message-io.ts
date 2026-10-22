@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import { connect, type SecureContextOptions } from 'node:tls';
 import type { Duplex, Transform } from 'node:stream';
 import { assertOlosPinApproval, verifyPinnedPeer, pinError, type OlosPinApproval } from '../security/olos-certificate-pin.js';
+import {reportInspectionFailure,type InspectionDiagnosticObserver} from '../olos/tds/inspection-diagnostics.js';
 const require = createRequire(import.meta.url);
 const MessageIO = require('tedious/lib/message-io.js') as typeof import('tedious/lib/message-io.js').default;
 const Pair = require('native-duplexpair') as new () => { socket1: Duplex; socket2: Duplex };
@@ -11,6 +12,7 @@ const Pair = require('native-duplexpair') as new () => { socket1: Duplex; socket
  * Keep certificate validation enabled; only the approved self-signed leaf is trusted.
  */
 export class PinnedMessageIO extends MessageIO {
+  inspectionDiagnostics:InspectionDiagnosticObserver|undefined;
   private used = false;
   constructor(...args: [...ConstructorParameters<typeof MessageIO>, OlosPinApproval]) {
     const [socket, size, debug, approval] = args;
@@ -18,12 +20,14 @@ export class PinnedMessageIO extends MessageIO {
   }
   private readonly approval: OlosPinApproval;
   override startTls(details: SecureContextOptions, _hostname: string, trustServerCertificate: boolean): Promise<void> {
+    this.inspectionDiagnostics?.({kind:'stage',stage:'TLS_HANDSHAKE_STARTED'});
+    const rejected=(error:unknown)=>{reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');return Promise.reject(error);};
     if (require('tedious/package.json').version !== '18.6.2' || this.used || trustServerCertificate ||
       details.minVersion !== 'TLSv1.2' || details.maxVersion !== 'TLSv1.2' ||
       Object.keys(details).some(k => !['minVersion','maxVersion'].includes(k)) || process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
-      return Promise.reject(pinError('PIN_CONFIGURATION_INVALID'));
+      return rejected(pinError('PIN_CONFIGURATION_INVALID'));
     }
-    try { assertOlosPinApproval(this.approval); } catch (error) { return Promise.reject(error); }
+    try { assertOlosPinApproval(this.approval); } catch (error) { return rejected(error); }
     this.used = true;
     const pair = new Pair();
     const tls = connect({ socket: pair.socket1, host: this.approval.host,
@@ -37,6 +41,7 @@ export class PinnedMessageIO extends MessageIO {
       const cleanup = () => { pair.socket2.removeListener('readable',onReadable); tls.removeListener('secureConnect',onSecure); tls.removeListener('error',fail); };
       const fail = (error: unknown) => {
         if (finished) return;
+        reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');
         finished = true; cleanup(); tls.destroy(); pair.socket2.destroy(); reject(error);
       };
       const onSecure = () => {
@@ -49,6 +54,7 @@ export class PinnedMessageIO extends MessageIO {
         this.outgoingMessageStream.unpipe(this.socket); this.socket.unpipe(incoming);
         this.socket.pipe(pair.socket2); pair.socket2.pipe(this.socket);
         tls.pipe(incoming); this.outgoingMessageStream.pipe(tls);
+        this.inspectionDiagnostics?.({kind:'stage',stage:'TLS_VALIDATED'});
         this.tlsNegotiationComplete = true; this.emit('secure',tls); resolve();
       };
       const onReadable = () => {
