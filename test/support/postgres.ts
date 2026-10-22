@@ -6,7 +6,7 @@ import pg from 'pg';
 
 const exec = promisify(execFile);
 // Nenhuma URL/credencial PG da máquina é consumida. Somente container criado por este helper.
-export async function isolatedPostgres() {
+export async function isolatedPostgres(options:{privateData?:boolean}={}) {
   const password = randomUUID();
   let id: string | undefined;
   let admin: pg.Pool | undefined;
@@ -17,7 +17,9 @@ export async function isolatedPostgres() {
   try {
     const result = await exec('docker', ['run','--rm','-d','--label','worker-olos-export-data.test=phase2a',
       '-p','127.0.0.1::5432','--tmpfs','/var/lib/postgresql/data:rw',
-      '-e','POSTGRES_PASSWORD','-e','POSTGRES_DB=phase2a_fixture','postgres:16-bookworm'],
+      '-e','POSTGRES_PASSWORD','-e','POSTGRES_DB=phase2a_fixture','postgres:16-bookworm',
+      // Historical test failures must never emit private rows/parameters to server logs.
+      ...(options.privateData?['-c','log_min_messages=panic','-c','log_min_error_statement=panic','-c','log_statement=none','-c','log_parameter_max_length=0','-c','log_parameter_max_length_on_error=0']:[])],
       { env: { ...process.env, POSTGRES_PASSWORD: password }, timeout: 120_000 });
     id = result.stdout.trim();
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('Invalid fixture container');

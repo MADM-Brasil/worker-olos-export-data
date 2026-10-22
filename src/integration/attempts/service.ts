@@ -1,7 +1,7 @@
 import type { Pool,PoolClient } from 'pg';
 import { AttemptsRuntimeControl,type WorkerRuntime,type CycleCounts } from './runtime-control.js';
 import { attemptsBlockers } from './contracts.js';
-import { APPROVED_COLUMNS } from '../../offline/tds-writer.js';
+import {assertAttemptsDestinationSchema} from './destination-schema.js';
 
 export interface RuntimePools {ingest:Pool;project:Pool;receiver:Pool;}
 export class AttemptsService implements WorkerRuntime {
@@ -49,13 +49,7 @@ export class AttemptsService implements WorkerRuntime {
       if(!(await this.pools.project.query("SELECT bool_and(has_column_privilege(current_user,'olos_export.projection_outbox',c,'UPDATE')) AS allowed FROM unnest($1::text[]) AS c",[projectColumns])).rows[0].allowed)throw Error('PRIVILEGE_REJECTED');
       const c=await this.pools.receiver.connect();
       try{await c.query('BEGIN READ ONLY');
-        const cols=(await c.query(`SELECT column_name,udt_name,datetime_precision FROM information_schema.columns WHERE table_schema='raw' AND table_name='olos_calls' ORDER BY ordinal_position`)).rows;
-        if(cols.length!==16 || cols.some((r,i)=>r.column_name!==APPROVED_COLUMNS[i] || r.udt_name!==(i===0 || i===15?'int8':i===2?'timestamp':i===13?'int4':'text')) || cols[2].datetime_precision!==6)throw Error('SCHEMA_REJECTED');
-        const pk=(await c.query(`SELECT array_agg(a.attname::text ORDER BY k.ord) AS keys FROM pg_constraint p
-          CROSS JOIN LATERAL unnest(p.conkey) WITH ORDINALITY k(attnum,ord) JOIN pg_attribute a ON a.attrelid=p.conrelid AND a.attnum=k.attnum
-          WHERE p.conrelid='raw.olos_calls'::regclass AND p.contype='p'`)).rows[0].keys;
-        if(JSON.stringify(pk)!==JSON.stringify(['internal_id_olos']))throw Error('SCHEMA_REJECTED');
-        for(const privilege of ['SELECT','INSERT'])if(!(await c.query("SELECT has_table_privilege(current_user,'raw.olos_calls',$1) AS allowed",[privilege])).rows[0].allowed)throw Error('PRIVILEGE_REJECTED');
+        await assertAttemptsDestinationSchema(c);
         const calls=(await c.query(`SELECT count(*)::text AS "totalCalls",count(cpf)::text AS "withCpf",count(email)::text AS "withEmail",count(nome_agente)::text AS "withAgentName" FROM raw.olos_calls`)).rows[0];
         await c.query('COMMIT');this.aggregates={...this.aggregates,...calls};
       }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}

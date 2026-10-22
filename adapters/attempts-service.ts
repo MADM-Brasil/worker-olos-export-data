@@ -10,6 +10,7 @@ import {localSettings} from './local-worker.js';
 import {loadOlosPinApproval} from '../src/security/olos-certificate-pin.js';
 import {serviceConfigSchema,validateServiceApproval,contractReviewSchema,validateReviewedContract,validateActivation,planForCapture,acquisitionProcedures,type ServiceConfig,type ContractReview,type AcquisitionProcedure,type ServiceApproval} from '../src/integration/attempts/activation.js';
 import {digest,canonical} from '../src/persistence/validation.js';
+import {agentMap,parseAgentCatalog} from '../src/offline/agents.js';
 import {catalog,recordsFromJson,parseLossless,type Catalogs} from '../src/offline/model.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 import {reportedSignature} from '../src/olos/procedure-signatures.js';
@@ -40,8 +41,9 @@ export async function loadServiceConfiguration(path:string){
  const config=serviceConfigSchema.parse(await privateJson(path));
  const campaigns=catalog(recordsFromJson(parseLossless(JSON.stringify(await privateJson(config.campaignFile))),true),'CampaignId','Description');
  const dispositions=catalog(recordsFromJson(parseLossless(JSON.stringify(await privateJson(config.dispositionFile))),true),'DispositionId','Description');
- const catalogs:Catalogs={campaigns,dispositions,agents:new Map()};
- return {config,catalogs,configurationDigest:digest({config,campaigns:[...campaigns],dispositions:[...dispositions]})};
+ const agents=config.agentFile?agentMap(parseAgentCatalog(JSON.stringify(await privateJson(config.agentFile)))):new Map<string,string>();
+ const catalogs:Catalogs={campaigns,dispositions,agents};
+ return {config,catalogs,configurationDigest:digest({config,campaigns:[...campaigns],dispositions:[...dispositions],...(config.agentFile?{agents:[...agents]}:{})})};
 }
 type Loaded=Awaited<ReturnType<typeof loadServiceConfiguration>>;
 export function serviceGuard(configFile:string,loaded:Loaded,approval:ServiceApproval){
@@ -51,7 +53,8 @@ export function serviceGuard(configFile:string,loaded:Loaded,approval:ServiceApp
   if(digest(privateServiceJsonSync(configFile))!==digest(config))throw Error('SERVICE_CONFIGURATION_CHANGED');
   const campaigns=catalog(recordsFromJson(parseLossless(JSON.stringify(privateServiceJsonSync(config.campaignFile))),true),'CampaignId','Description');
   const dispositions=catalog(recordsFromJson(parseLossless(JSON.stringify(privateServiceJsonSync(config.dispositionFile))),true),'DispositionId','Description');
-  if(digest({config,campaigns:[...campaigns],dispositions:[...dispositions]})!==configurationDigest)throw Error('SERVICE_CONFIGURATION_CHANGED');
+  const agents=config.agentFile?agentMap(parseAgentCatalog(JSON.stringify(privateServiceJsonSync(config.agentFile)))):new Map<string,string>();
+  if(digest({config,campaigns:[...campaigns],dispositions:[...dispositions],...(config.agentFile?{agents:[...agents]}:{})})!==configurationDigest)throw Error('SERVICE_CONFIGURATION_CHANGED');
   const current=validateServiceApproval(privateServiceJsonSync(config.approvalFile),config,configurationDigest,existsSync(approval.revocationFile));
   if(digest(current)!==digest(approval))throw Error('SERVICE_AUTHORIZATION_REJECTED');
   }catch(e){if(e instanceof Error && ['SERVICE_CONFIGURATION_CHANGED','SERVICE_AUTHORIZATION_REJECTED','DESTINATION_MAPPING_NOT_APPROVED'].includes(e.message))throw e;throw Error('SERVICE_AUTHORIZATION_REJECTED');}

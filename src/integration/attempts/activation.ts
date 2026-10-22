@@ -11,7 +11,7 @@ const text=z.string().trim().min(1).max(1000),sha=z.string().regex(/^[a-f0-9]{64
 export const serviceConfigSchema=z.object({version:z.literal('olos-service/v2'),workerId:text,endpoint:z.unknown(),
   postgres:z.object({host:z.string().min(1),port:z.number().int(),database:z.literal('olos_worker')}).strict(),
   pinApprovalFile:z.string().startsWith('/'),approvalFile:z.string().startsWith('/'),profile:profileSchema,
-  campaignFile:z.string().startsWith('/'),dispositionFile:z.string().startsWith('/')}).strict();
+  agentFile:z.string().startsWith('/').optional(),campaignFile:z.string().startsWith('/'),dispositionFile:z.string().startsWith('/')}).strict();
 export type ServiceConfig=z.infer<typeof serviceConfigSchema>;
 export const serviceApprovalSchema=z.object({scope:z.literal('OLOS_ATTEMPTS_SERVICE'),approvalId:text,workerId:text,
   configurationDigest:sha,procedures:z.tuple([z.literal('ReadDataCurrentDay'),z.literal('ReadDataPreviousDays')]),

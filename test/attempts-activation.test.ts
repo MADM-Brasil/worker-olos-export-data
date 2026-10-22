@@ -158,3 +158,23 @@ it('a complete response with unsupported layout remains sealed in quarantine and
  await expect(prepareServiceContract(root,loaded,pending!.attemptId)).rejects.toThrow('OBSERVED_CONTRACT_NOT_APPROVED');
  await expect(capture()).rejects.toThrow('RECOVERY_REQUIRED');
 });
+it('V2 loads an optional sanitized agent snapshot, binding its contents to the configuration digest',async()=>{
+ const agentFile=join(base,'agents.json');await save(agentFile,[{AgentId:'1',UserName:'test-reference'}]);
+ await save(configFile,{...loaded.config,agentFile});
+ const revised=await loadServiceConfiguration(configFile);
+ expect(revised.catalogs.agents.get('1')==='test-reference').toBe(true);
+ expect(revised.configurationDigest===loaded.configurationDigest).toBe(false);
+ const revisedApproval={...approval(),configurationDigest:revised.configurationDigest};await save(revised.config.approvalFile,revisedApproval);
+ const check=serviceGuard(configFile,revised,revisedApproval);check();
+ await save(agentFile,[{AgentId:'1',UserName:'test-reference-updated'}]);expect(check).toThrow('SERVICE_CONFIGURATION_CHANGED');
+});
+it('120 seconds are counted from completion, even when a successful cycle takes longer than the interval',async()=>{
+ vi.useFakeTimers();try{
+  let release!:()=>void,calls=0;const runner=new AttemptsCycleRunner(async()=>{calls++;await new Promise<void>(r=>{release=r;});},120000);
+  runner.start();await vi.advanceTimersByTimeAsync(119999);expect(calls).toBe(0);
+  await vi.advanceTimersByTimeAsync(1);await vi.advanceTimersByTimeAsync(480000);expect(calls).toBe(1);expect(runner.nextExecutionAt).toBeNull();
+  release();await vi.advanceTimersByTimeAsync(0);expect(runner.nextExecutionAt).toBe(new Date(Date.now()+120000).toISOString());
+  await vi.advanceTimersByTimeAsync(119999);expect(calls).toBe(1);await vi.advanceTimersByTimeAsync(1);expect(calls).toBe(2);
+  release();await vi.advanceTimersByTimeAsync(0);await runner.stop();
+ }finally{vi.useRealTimers();}
+});
