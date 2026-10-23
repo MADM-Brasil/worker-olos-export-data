@@ -51,15 +51,16 @@ export class ProjectionOutbox {
     });
   }
   /** One durable claim transaction, one batch at a time, with the existing lease/fence. */
-  async claimBatch(owner: string, limit = projectionClaimBatchSize): Promise<DeliveryClaim[]> {
+  async claimBatch(owner: string, limit = projectionClaimBatchSize, batchId?: string): Promise<DeliveryClaim[]> {
     assertUuid(owner);
+    if(batchId!==undefined)assertUuid(batchId);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > projectionClaimBatchSize) throw new PersistenceError('VALIDATION_FAILED');
     return transaction(this.pool, async client => {
       const ledger = await client.query<{ version: number }>('SELECT version FROM olos_export.projection_schema_versions ORDER BY version');
       if (ledger.rows.length !== 1 || ledger.rows[0]?.version !== 1) throw new PersistenceError('SCHEMA_NOT_READY');
       const picked = await client.query<DeliveryMessage & { generation: string }>(`WITH candidates AS MATERIALIZED (
         SELECT delivery_id,batch_id,created_at FROM olos_export.projection_outbox
-        WHERE destination_id=$1 AND state='pending' AND available_at<=clock_timestamp()
+        WHERE destination_id=$1 AND state='pending' AND available_at<=clock_timestamp() AND ($5::uuid IS NULL OR batch_id=$5)
           AND (lease_until IS NULL OR lease_until<=clock_timestamp())
         ORDER BY created_at,delivery_id FOR UPDATE SKIP LOCKED LIMIT $4
       ), claimed AS (
@@ -71,7 +72,7 @@ export class ProjectionOutbox {
       ) SELECT o.delivery_id,o.batch_id,o.destination_id,o.source_key,o.payload,o.request_payload,o.request_digest,o.generation,
         b.source_table,b.source_namespace,b.source_contract_version,b.field_definitions,b.destination_version,b.mapping_version
         FROM claimed o JOIN olos_export.projection_batches b USING(batch_id,destination_id)
-        ORDER BY o.created_at,o.delivery_id`, [this.destinationId,owner,this.leaseMs,limit]);
+        ORDER BY o.created_at,o.delivery_id`, [this.destinationId,owner,this.leaseMs,limit,batchId??null]);
       if (!picked.rows.length) return [];
       await client.query(`INSERT INTO olos_export.projection_events(id,delivery_id,generation,attempt_id,event)
         SELECT x.id,x.delivery_id,x.generation,NULL,'claimed'

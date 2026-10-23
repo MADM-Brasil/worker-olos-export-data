@@ -23,11 +23,12 @@ import {decodeWireRow} from '../src/large-batch/wire.js';
 import {projectTdsAttempts} from '../src/offline/tds-projection.js';
 import {IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
 import {createAttemptsPipeline} from '../src/integration/attempts/pipeline.js';
-import {PostgresLargeBatchPersistence} from '../src/persistence/large-batch.js';
+import {PostgresLargeBatchPersistence,manifestDigest} from '../src/persistence/large-batch.js';
 import type {SpoolManifest} from '../src/large-batch/types.js';
 import {AttemptsService,type RuntimePools} from '../src/integration/attempts/service.js';
 import {createLocalRuntimePools} from '../src/integration/attempts/pools.js';
 import {serveWorker} from '../src/main.js';
+import {queuedCaptureSchema,handoffCapture,captureAdmission,queueLimitsSchema,FairCaptureDelivery,type QueuedCapture} from './service-capture-queue.js';
 
 const text=z.string().trim().min(1).max(1000),sha=z.string().regex(/^[a-f0-9]{64}$/);
 export async function serviceExists(path:string){try{await lstat(path);return true;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}}
@@ -175,7 +176,7 @@ export async function promoteService(root:string,loaded:Loaded,approval:ServiceA
 }
 
 /** No source calls: the only source registered here is replayTdsResponse, sealed and digest checked. */
-export async function deliverServiceCapture(root:string,loaded:Loaded,intent:Intent,review:ContractReview,pools:RuntimePools,signal:AbortSignal){
+async function captureDelivery(root:string,loaded:Loaded,intent:Intent,review:ContractReview,pools:RuntimePools,independent=false){
  const {spool:capture,response}=await captureInfo(root,intent.attemptId);
  if(intent.configurationDigest!==loaded.configurationDigest)throw Error('SERVICE_CONFIGURATION_CHANGED');
  validateReviewedContract(review,response.fields,intent.procedure);
@@ -185,8 +186,13 @@ export async function deliverServiceCapture(root:string,loaded:Loaded,intent:Int
  const replay=replayTdsResponse(review.fields,()=>capture.responseChunks(intent.attemptId),response.received);
  const binding=createApprovedCaptureReplayBinding(plan,review.fields,loaded.config.profile,loaded.catalogs,replay);
  const dir=join(root,'cases',intent.attemptId),spool=await LocalSpool.open(join(dir,'import'),spoolLimits());
- const pipeline=createAttemptsPipeline(pools.ingest,pools.project,pools.receiver,spool,spoolLimits(),binding);
+ const pipeline=createAttemptsPipeline(pools.ingest,pools.project,pools.receiver,spool,spoolLimits(),binding,independent);
  const started=join(dir,'import-started.json'),done=join(dir,'delivered.json');
+ return {response,plan,binding,dir,spool,pipeline,started,done};
+}
+export async function deliverServiceCapture(root:string,loaded:Loaded,intent:Intent,review:ContractReview,pools:RuntimePools,signal:AbortSignal){
+ if(await serviceExists(join(root,'queue-mode.json')))throw Error('CAPTURE_QUEUE_RECOVERY_REQUIRED');
+ const {response,plan,binding,dir,spool,pipeline,started,done}=await captureDelivery(root,loaded,intent,review,pools);
  if(await serviceExists(done)){
   const saved=await privateJson(done) as {received:number;persisted:number;duplicates:number;rejected:number;confirmedAt:string;captureSha256:string;reviewDigest:string;batchId:string};
   if(saved.captureSha256!==response.sha256 || saved.reviewDigest!==digest(review) || !saved.batchId)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
@@ -262,7 +268,7 @@ async function historicalInspectionStatus(base:string){
  }
 }
 
-export interface ServiceOptions{base:string;root:string;configFile:string;intervalMs:number;}
+export interface ServiceOptions{base:string;root:string;configFile:string;intervalMs:number;queueMaxCaptures?:number|undefined;queueMaxBytes?:number|undefined;}
 async function serviceAuthorization(options:ServiceOptions){
  const loaded=await loadServiceConfiguration(options.configFile);
  const approval=validateServiceApproval(await privateJson(loaded.config.approvalFile),loaded.config,loaded.configurationDigest,
@@ -283,6 +289,13 @@ export async function operationalServiceStatus(options:ServiceOptions){
   }catch{result.state='RECOVERY_REQUIRED';result.lastError='ACTIVATION_REVALIDATION_FAILED';}
  }
  if(await serviceExists(join(base,'remote-pending.json'))){result.state='RECOVERY_REQUIRED';const p=await privateJson(join(base,'remote-pending.json')) as {attemptId?:string};result.pendingBatch=p.attemptId??null;}
+ if(await serviceExists(join(root,'queue-mode.json'))){
+  let queued=0,delivered=0;
+  for(const id of await readdir(join(root,'cases'))){if(!z.string().uuid().safeParse(id).success)continue;
+   if(await serviceExists(join(root,'cases',id,'queued.json'))){queuedCaptureSchema.parse(await privateJson(join(root,'cases',id,'queued.json')));queued++;
+    if(await serviceExists(join(root,'cases',id,'delivered.json')))delivered++;}}
+  result.captureQueue={queued,delivered,pending:queued-delivered};
+ }
  result.historicalInspection=await historicalInspectionStatus(base);
  if(await serviceExists(join(root,'cycles'))){const names=(await readdir(join(root,'cycles'))).filter(n=>/^\d+-[a-f0-9-]+\.json$/.test(n)).sort();
   if(names.length){const last=await privateJson(join(root,'cycles',names.at(-1)!)) as Record<string,unknown>;
@@ -357,6 +370,7 @@ async function closeNotDispatchedServiceCase(options:ServiceOptions,attemptId:st
 }
 
 export async function serviceCycle(options:ServiceOptions,pools:RuntimePools,signal:AbortSignal){
+ if(await serviceExists(join(options.root,'queue-mode.json')))throw Error('CAPTURE_QUEUE_RECOVERY_REQUIRED');
  const {loaded,approval,guard}=await serviceAuthorization(options);guard();const reviews=await assertActive(options,loaded,approval);
  const activation=await privateJson(join(options.root,'activation.json')) as {recoveryEvidence:string;recoveryDigest:string};
  const activeGuard=()=>{guard();if(digest(privateServiceJsonSync(join(options.root,'activation.json')))!==digest(activation) || digest(privateServiceJsonSync(activation.recoveryEvidence))!==activation.recoveryDigest ||
@@ -387,6 +401,171 @@ export async function serviceCycle(options:ServiceOptions,pools:RuntimePools,sig
  await finishServiceCase(options.base,options.root,pending);
  return {...result,acquisitionPerformed:acquired};
 }
+
+/** One instance-lock owner, one serial acquisition scheduler and one local consumer. */
+export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePools,loaded:Loaded,guard:()=>void,capture=observeServiceCapture){
+ const {root,base}=options,limits=queueLimitsSchema.parse({maxCaptures:options.queueMaxCaptures,maxBytes:options.queueMaxBytes});
+ type Item={entry:QueuedCapture;intent:Intent;review:ContractReview;context?:Awaited<ReturnType<typeof captureDelivery>>;manifest?:SpoolManifest;done:boolean};
+ const items:Item[]=[],fair=new FairCaptureDelivery();
+ let initialized=false,acquiring=false,delivering=false,failed=false,last:Intent|undefined,ordinal=0;
+ let lastImportConfirmedAt:string|null=null,lastError:string|null=null;
+ let admission:Awaited<ReturnType<typeof captureAdmission>>|null=null;
+ const check=(signal:AbortSignal)=>{if(failed)throw Error('RECOVERY_REQUIRED');guard();if(signal.aborted)throw Error('STOPPED');};
+ async function reviewed(intent:Intent){
+  const review=contractReviewSchema.parse(await privateJson(join(root,'reviews',`${intent.procedure}.json`)));
+  if(review.configurationDigest!==loaded.configurationDigest)throw Error('OBSERVED_CONTRACT_NOT_APPROVED');
+  return review;
+ }
+ async function enqueue(intent:Intent,review:ContractReview){
+  const {response}=await captureInfo(root,intent.attemptId),dir=join(root,'cases',intent.attemptId);
+  const metadata=await privateJson(join(dir,'capture','batches',intent.attemptId,'response.json')) as {rawMessageComplete?:boolean};
+  if(metadata.rawMessageComplete!==true || intent.workDir!==root || intent.configurationDigest!==loaded.configurationDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+  validateReviewedContract(review,response.fields,intent.procedure);
+  if(intent.contractReviewDigest && intent.contractReviewDigest!==digest(review))throw Error('OBSERVED_CONTRACT_NOT_APPROVED');
+  if(intent.plan && canonical(intent.plan)!==canonical(planForCapture(review,new Date(intent.createdAt))))throw Error('OBSERVED_CONTRACT_NOT_APPROVED');
+  const path=join(dir,'queued.json');
+  const pendingPath=await serviceExists(path) && !await serviceExists(join(base,'remote-pending.json'))?join(dir,'remote-pending.captured.json'):join(base,'remote-pending.json');
+  const existing=await serviceExists(path)?queuedCaptureSchema.parse(await privateJson(path)):null;
+  const marker=await privateJson(pendingPath);
+  const entry:QueuedCapture={kind:'olos-capture-queue/v1',captureId:intent.attemptId,ordinal:existing?.ordinal??ordinal+1,
+   captureSha256:response.sha256,intentDigest:digest(intent),reviewDigest:digest(review),configurationDigest:loaded.configurationDigest,pendingDigest:digest(marker)};
+  await handoffCapture(base,root,entry);ordinal=Math.max(ordinal,entry.ordinal);
+  items.push({entry,intent,review,done:false});last=intent;return response.received;
+ }
+ async function context(item:Item){return item.context??=await captureDelivery(root,loaded,item.intent,item.review,pools,true);}
+ async function materialize(item:Item,signal:AbortSignal){
+  const ctx=await context(item),{spool,pipeline,started,dir,plan}=ctx;
+  const proof={attemptId:item.intent.attemptId,reviewDigest:item.entry.reviewDigest,captureSha256:item.entry.captureSha256};
+  if(await serviceExists(started)){if(digest(await privateJson(started))!==digest(proof))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');}
+  else await durableExclusive(started,proof);
+  let batches=await readdir(join(dir,'import','batches'));
+  if(await spool.active() || !batches.length)await pipeline.materializeLocal(signal);
+  batches=await readdir(join(dir,'import','batches'));
+  if(batches.length!==1)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+  const m=await privateJson(join(dir,'import','batches',batches[0]!,'manifest.json')) as SpoolManifest;
+  if(!m.sealed || m.state!=='committed' || canonical(m.identity.plan)!==canonical(plan))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+  // The existing receipt path checks the exact manifest digest; never starts a second ingestion.
+  await pipeline.writer.persist(m,{runId:m.identity.runId,streamId:m.identity.streamId,fencingToken:m.identity.fencingToken,signal},()=>spool.records(m));
+  item.manifest=m;
+ }
+ return {
+  snapshot:()=>({captureQueue:{pending:items.filter(i=>!i.done).length,materialized:items.filter(i=>!i.done && i.manifest).length,limits,admission},deliveryInFlight:delivering,
+   lastDurableCaptureId:last?.attemptId??null,lastProcedure:last?.procedure??null,lastImportConfirmedAt,lastError}),
+  async initialize(signal:AbortSignal){
+   try{if(initialized)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');check(signal);
+   const knownBatches:string[]=[],knownRuns:string[]=[];
+   const intents=await Promise.all((await readdir(root)).filter(n=>/^attempt-[a-f0-9-]+\.json$/.test(n)).map(async n=>{
+    const intent=captureIntentSchema.parse(await privateJson(join(root,n)));
+    if(n!==`attempt-${intent.attemptId}.json` || intent.workDir!==root || intent.configurationDigest!==loaded.configurationDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');return intent;
+   }));
+   const pending=await pendingServiceCase(base,root);
+   const positions=new Map<string,number>(),seen=new Set<number>();
+   for(const intent of intents){const file=join(root,'cases',intent.attemptId,'queued.json');if(await serviceExists(file)){
+    const entry=queuedCaptureSchema.parse(await privateJson(file));
+    if(entry.captureId!==intent.attemptId || seen.has(entry.ordinal))throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+    positions.set(intent.attemptId,entry.ordinal);seen.add(entry.ordinal);
+   }}
+   const rank=(intent:Intent)=>positions.get(intent.attemptId)??(intent.attemptId===pending?.attemptId?Number.MAX_SAFE_INTEGER:0);
+   intents.sort((a,b)=>rank(a)-rank(b)||a.createdAt.localeCompare(b.createdAt)||a.attemptId.localeCompare(b.attemptId));
+   for(const intent of intents){
+    check(signal);const dir=join(root,'cases',intent.attemptId);
+    if(await serviceExists(join(dir,'not-dispatched-closed.json')))continue;
+    const review=await reviewed(intent);
+    const caseManifests:SpoolManifest[]=[];
+    if(await serviceExists(join(dir,'import','batches')))for(const id of await readdir(join(dir,'import','batches'))){
+     const m=await privateJson(join(dir,'import','batches',id,'manifest.json')) as SpoolManifest;
+     caseManifests.push(m);
+     knownBatches.push(m.identity.batchId);knownRuns.push(m.identity.runId);
+    }
+    if(await serviceExists(join(dir,'delivered.json'))){
+     const {response}=await captureInfo(root,intent.attemptId),ack=await privateJson(join(dir,'delivered.json')) as {captureSha256:string;reviewDigest:string;batchId:string;confirmedAt:string};
+     if(ack.captureSha256!==response.sha256 || ack.reviewDigest!==digest(review))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+     const manifest=caseManifests[0];
+     if(caseManifests.length!==1 || !manifest?.sealed || manifest.state!=='committed' || manifest.rows!==response.received || manifest.identity.batchId!==ack.batchId ||
+      canonical(manifest.identity.plan)!==canonical(planForCapture(review,new Date(intent.createdAt))))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+     if((await pools.ingest.query('SELECT manifest_digest FROM olos_export.large_batch_receipts WHERE batch_id=$1',[ack.batchId])).rows[0]?.manifest_digest!==manifestDigest(manifest) ||
+      (await pools.project.query("SELECT 1 FROM olos_export.projection_outbox WHERE batch_id=$1 AND state<>'confirmed' LIMIT 1",[ack.batchId])).rowCount)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+     if(!lastImportConfirmedAt || ack.confirmedAt>lastImportConfirmedAt)lastImportConfirmedAt=ack.confirmedAt;
+     if(pending?.attemptId===intent.attemptId)await finishServiceCase(base,root,intent);
+     if(await serviceExists(join(dir,'queued.json')))ordinal=Math.max(ordinal,queuedCaptureSchema.parse(await privateJson(join(dir,'queued.json'))).ordinal);
+     last=intent;continue;
+    }
+    if(await serviceExists(join(dir,'queued.json'))){
+     const entry=queuedCaptureSchema.parse(await privateJson(join(dir,'queued.json')));
+     if(entry.ordinal<=ordinal || entry.captureId!==intent.attemptId || entry.intentDigest!==digest(intent) || entry.reviewDigest!==digest(review) || entry.configurationDigest!==loaded.configurationDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+     const {response}=await captureInfo(root,intent.attemptId);
+     const meta=await privateJson(join(dir,'capture','batches',intent.attemptId,'response.json')) as {rawMessageComplete?:boolean};
+     if(response.sha256!==entry.captureSha256 || meta.rawMessageComplete!==true)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+     if(pending?.attemptId===intent.attemptId)await handoffCapture(base,root,entry);
+     else if(digest(await privateJson(join(dir,'remote-pending.captured.json')))!==entry.pendingDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+     ordinal=entry.ordinal;items.push({entry,intent,review,done:false});last=intent;
+    }else{
+     if(pending?.attemptId!==intent.attemptId)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+     await enqueue(intent,review);
+    }
+   }
+   if(await pendingServiceCase(base,root))throw Error('RECOVERY_REQUIRED');
+   if((await pools.ingest.query("SELECT 1 FROM olos_export.runs WHERE source_table='AttemptsRawData' AND state IN ('read_intent','persisting','needs_reconciliation') AND NOT(id=ANY($1::uuid[])) LIMIT 1",[knownRuns])).rowCount ||
+    (await pools.project.query("SELECT 1 FROM olos_export.projection_outbox WHERE state<>'confirmed' AND NOT(batch_id=ANY($1::uuid[])) LIMIT 1",[knownBatches])).rowCount)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+   const mode={kind:'olos-independent-delivery/v1',configurationDigest:loaded.configurationDigest};
+   if(await serviceExists(join(root,'queue-mode.json'))){if(digest(await privateJson(join(root,'queue-mode.json')))!==digest(mode))throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');}
+   else await durableExclusive(join(root,'queue-mode.json'),mode);
+   // Recover already-started work before arming any new acquisition. Expired/uncertain local runs still fail closed.
+   let unstarted=false;
+   for(const item of items){if(await serviceExists(join(root,'cases',item.intent.attemptId,'import-started.json'))){
+    if(unstarted)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+    await materialize(item,signal);await item.context!.pipeline.reconcileLocal(item.manifest!.identity.batchId,signal);
+   }else unstarted=true;}
+   initialized=true;
+   }catch(error){failed=true;lastError??=queueError(error);throw error;}
+  },
+  async acquire(signal:AbortSignal){
+   if(!initialized || acquiring)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');acquiring=true;
+   try{check(signal);
+    const authorized=await serviceAuthorization(options),reviews=await assertActive(options,authorized.loaded,authorized.approval);
+    if(authorized.loaded.configurationDigest!==loaded.configurationDigest)throw Error('SERVICE_CONFIGURATION_CHANGED');
+    const activation=await privateJson(join(root,'activation.json')) as {recoveryEvidence:string;recoveryDigest:string};
+    const activeGuard=()=>{check(signal);authorized.guard();if(digest(privateServiceJsonSync(join(root,'activation.json')))!==digest(activation) || digest(privateServiceJsonSync(activation.recoveryEvidence))!==activation.recoveryDigest || reviews.some(r=>digest(privateServiceJsonSync(join(root,'reviews',`${r.procedure}.json`)))!==digest(r)))throw Error('ACTIVATION_REQUIREMENTS_MISSING');};
+    if(await pendingServiceCase(base,root))throw Error('RECOVERY_REQUIRED');
+    admission=await captureAdmission(root,items.filter(i=>!i.done).length,items.filter(i=>!i.done && !i.manifest).length,limits,spoolLimits().maxDiskBytes,spoolLimits().minFreeBytes);
+    if(!admission.allowed)return {received:0,persisted:0,duplicates:0,rejected:0,acquisitionPerformed:false};
+    const procedure=last?.procedure==='ReadDataCurrentDay'?'ReadDataPreviousDays':'ReadDataCurrentDay',review=reviews.find(r=>r.procedure===procedure)!;
+    await new PostgresLargeBatchPersistence(pools.ingest,spoolLimits(),300000).preflight(planForCapture(review));activeGuard();
+    const intent=await capture(base,root,loaded,authorized.approval,activeGuard,procedure,signal,review);
+    const received=await enqueue(intent,review);
+    return {received,persisted:0,duplicates:0,rejected:0,acquisitionPerformed:true};
+   }catch(error){failed=true;lastError??=queueError(error);throw error;}finally{acquiring=false;}
+  },
+  async step(signal:AbortSignal){
+   if(!initialized || delivering)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');delivering=true;
+   try{check(signal);
+    const next=items.find(i=>!i.done && !i.manifest);if(next)await materialize(next,signal);
+    const selected=fair.select(items.filter(i=>!i.done && i.manifest).map(item=>({ordinal:item.entry.ordinal,item})))?.item;
+    if(!selected)return false;
+    const ctx=await context(selected);check(signal);
+    if(digest(privateServiceJsonSync(join(root,'reviews',`${selected.intent.procedure}.json`)))!==selected.entry.reviewDigest)throw Error('OBSERVED_CONTRACT_NOT_APPROVED');
+    const result=await ctx.pipeline.deliverStep(selected.manifest!.identity.batchId,signal);
+    if(result.complete){
+     await ctx.pipeline.writer.confirmDeliveryCheckpoint(selected.manifest!);
+     const receipt=(await pools.ingest.query('SELECT received_count,persisted_count,duplicate_count,rejected_count FROM olos_export.batches WHERE id=$1 AND state=$2',[selected.manifest!.identity.batchId,'committed'])).rows[0];
+     if(!receipt)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+     const confirmedAt=new Date().toISOString();
+     await durableExclusive(ctx.done,{received:receipt.received_count,persisted:receipt.persisted_count,duplicates:receipt.duplicate_count,rejected:receipt.rejected_count,
+      confirmedAt,captureSha256:selected.entry.captureSha256,reviewDigest:selected.entry.reviewDigest,batchId:selected.manifest!.identity.batchId});
+     lastImportConfirmedAt=confirmedAt;
+     selected.done=true;delete selected.context;
+     items.splice(items.indexOf(selected),1); // Retain evidence on disk, not completed replay contexts in memory.
+    }
+    return result.complete || result.count>0;
+   }catch(error){failed=true;lastError??=queueError(error);throw error;}finally{delivering=false;}
+  }
+ };
+}
+function queueError(error:unknown){
+ const codes=['CAPTURE_QUEUE_REQUIRES_REVIEW','CAPTURE_QUEUE_RECOVERY_REQUIRED','LOCAL_COMMIT_REQUIRES_REVIEW','DELIVERY_REQUIRES_RECONCILIATION','CHECKPOINT_CONFLICT','LEASE_LOST','COMMIT_UNKNOWN','OBSERVED_CONTRACT_NOT_APPROVED','SERVICE_CONFIGURATION_CHANGED','RECOVERY_REQUIRED','STOPPED'];
+ const e=error as {code?:string;message?:string}|null;
+ return [e?.code,e?.message].find(code=>code && codes.includes(code))??inspectionErrorCode(error);
+}
 export async function serviceCommand(action:string,options:ServiceOptions,flags:Record<string,string>){
  if(action==='service-status')return operationalServiceStatus(options);
  await directories(options.base,options.root);
@@ -412,6 +591,11 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
   const review=contractReviewSchema.parse(await privateJson(join(options.root,'reviews',`${pending.procedure}.json`)));
   const result=await deliverServiceCapture(options.root,loaded,pending,review,pools,signal);await finishServiceCase(options.base,options.root,pending);return {...result,state:'BOOTSTRAP'};
  },true);
+ if(action==='recover-queue')return withLocalLock(options,async(pools,signal)=>{
+  const queue=createServiceCaptureQueue(options,pools,loaded,guard);await queue.initialize(signal);
+  while((queue.snapshot().captureQueue.pending)>0){if(!await queue.step(signal))throw Error('DELIVERY_REQUIRES_RECONCILIATION');}
+  return {event:'service_queue_recovered',...queue.snapshot(),acquisitionPerformed:false,schedulerStarted:false};
+ },true);
  if(action==='activate'){
   if(await serviceExists(join(options.base,'remote-pending.json')))throw Error('RECOVERY_REQUIRED');
   await promoteService(options.root,loaded,approval,await privateJson(flags['--activation-file']!));return {state:'ACTIVE',schedulerStarted:false};
@@ -420,6 +604,7 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
   await assertActive(options,loaded,approval);
   const settings=await localSettings();if(canonical(settings.postgres)!==canonical(loaded.config.postgres))throw Error('POSTGRES_DESTINATION_CHANGED');
   const pools=createLocalRuntimePools(settings.passwords,()=>{},settings.postgres);
+  const queue=createServiceCaptureQueue(options,pools,loaded,guard);
   const previousStatus=await operationalServiceStatus(options);
   const status:Record<string,unknown>={...previousStatus,nextExecutionAt:null,schedulerActive:false};
   await mkdir(join(options.root,'cycles'),{recursive:true,mode:0o700});await privateDirectory(join(options.root,'cycles'));
@@ -428,17 +613,17 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
    status.lastCycleStartedAt=new Date().toISOString();status.nextExecutionAt=null;
    try{
     try{const pin=await loadOlosPinApproval(loaded.config.pinApprovalFile);status.tls={valid:true,expiresAt:pin.expiresAt};}catch(error){status.tls={valid:false,code:inspectionErrorCode(error)};} // Local replay remains possible without a live source/pin.
-    const counts=await serviceCycle(options,pools,signal);
-    const completed=new Date().toISOString();Object.assign(status,{state:'ACTIVE',lastCycleCompletedAt:completed,lastImportConfirmedAt:counts.confirmedAt??status.lastImportConfirmedAt,imported:counts.received,duplicates:counts.duplicates,pendingBatch:null,lastError:null,nextExecutionAt:new Date(Date.now()+120000).toISOString()});
+    const counts=await queue.acquire(signal);
+    const completed=new Date().toISOString();Object.assign(status,{state:'ACTIVE',lastCycleCompletedAt:completed,pendingBatch:null,lastError:null,nextExecutionAt:new Date(Date.now()+120000).toISOString()});
     const intents=(await readdir(options.root)).filter(f=>/^attempt-.*\.json$/.test(f));let latest:Intent|undefined;
-    for(const name of intents){const i=captureIntentSchema.parse(await privateJson(join(options.root,name)));if(!await serviceExists(join(options.root,'cases',i.attemptId,'delivered.json')))continue;if(!latest || i.createdAt>latest.createdAt)latest=i;}
+    for(const name of intents){const i=captureIntentSchema.parse(await privateJson(join(options.root,name)));if(!await serviceExists(join(options.root,'cases',i.attemptId,'queued.json')))continue;if(!latest || i.createdAt>latest.createdAt)latest=i;}
     status.lastProcedure=latest?.procedure??null;
     await durableExclusive(join(options.root,'cycles',`${Date.now()}-${randomUUID()}.json`),status);return counts;
    }catch(error){
     try{const pending=await pendingServiceCase(options.base,options.root);status.pendingBatch=pending?.attemptId??null;status.lastAttemptedProcedure=pending?.procedure??null;}catch{/* keep unavailable status null */}
     Object.assign(status,{state:'RECOVERY_REQUIRED',lastError:inspectionErrorCode(error),nextExecutionAt:null,schedulerActive:false});
     await durableExclusive(join(options.root,'cycles',`${Date.now()}-${randomUUID()}.json`),status).catch(()=>{});throw error;}
-  },'corporate-service',()=>({...status,state:status.state==='RECOVERY_REQUIRED' || (status.tls as {valid:boolean}|null)?.valid===false || !runtime?.snapshotBaseArmed()?'RECOVERY_REQUIRED':'ACTIVE',postgresState:runtime?.snapshotDatabaseState()??'unknown',countsScope:'confirmed_capture_records_and_ingestion_duplicates',businessRowsInserted:null,nextExecutionAt:runtime?.snapshotNextExecutionAt()??null,schedulerActive:runtime?.snapshotBaseArmed()??false}));
+  },'corporate-service',()=>({...status,...queue.snapshot(),state:(status.tls as {valid:boolean}|null)?.valid===false || !runtime?.snapshotBaseArmed()?'RECOVERY_REQUIRED':'ACTIVE',postgresState:runtime?.snapshotDatabaseState()??'unknown',countsScope:'postgres_aggregate_delivery_counts',businessRowsInserted:null,nextExecutionAt:runtime?.snapshotNextExecutionAt()??null,schedulerActive:runtime?.snapshotBaseArmed()??false}),queue);
   status.nextExecutionAt=new Date(Date.now()+120000).toISOString();
   await serveWorker({...settings.config,SYNC_INTERVAL_MS:120000},[{name:'postgres',configured:true,probe:()=>runtime.probe(),close:async()=>{}}],runtime);
   return;

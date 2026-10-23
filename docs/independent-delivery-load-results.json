@@ -1,0 +1,17 @@
+{
+  "node": "20.20.2",
+  "postgres": "16",
+  "rows": 200000,
+  "recentRows": 256,
+  "historicalRows": 199744,
+  "recentCompletionMs": 272,
+  "totalMs": 391374,
+  "verified": {
+    "business": 200000,
+    "receipts": 200000,
+    "confirmed": 200000,
+    "pending": 0,
+    "mismatches": 0
+  },
+  "productionAccessed": false
+}

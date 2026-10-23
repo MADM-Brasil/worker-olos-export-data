@@ -95,6 +95,12 @@ it('plain CLI actions use the same private configuration/case and never enable g
   root:join(homedir(),'.local/state/olos-worker/corporate-attempts/first-run'),configFile:join(homedir(),'.config/olos-worker/attempts-corporate.json'),intervalMs:60000});
  expect(()=>parseCorporateArguments(['once'],{NODE_TLS_REJECT_UNAUTHORIZED:'0'})).toThrow();
 });
+it('queue recovery is explicit local work and admission bounds never enable generic synchronization',()=>{
+ expect(parseCorporateArguments(['recover-queue','--confirm','LOCAL_RECOVERY_ONLY'],{SYNC_ENABLED:'false'}).action).toBe('recover-queue');
+ expect(parseCorporateArguments(['start','--queue-max-captures','8','--queue-max-bytes','8589934592'],{})).toMatchObject({queueMaxCaptures:8,queueMaxBytes:8589934592});
+ for(const args of [['start','--queue-max-captures','0'],['start','--queue-max-bytes','NaN'],['recover-queue','--queue-max-captures','8']])expect(()=>parseCorporateArguments(args,{})).toThrow('CORPORATE_COMMAND_REJECTED');
+ expect(()=>parseCorporateArguments(['recover-queue'],{SYNC_ENABLED:'true'})).toThrow('CORPORATE_COMMAND_REJECTED');
+});
 it('a duplicate layout reference and repeated fixed policies are unnecessary; contract and recovery gates remain mandatory',()=>{
  const original=config(),{layoutEvidence:_l,partitionPolicy:_p,failurePolicy:_f,...authorization}=original.authorization;
  const c=corporateConfigSchema.parse({...original,authorization:{...authorization,sharedConsumptionEvidence:'R1',recoveryEvidence:'R2'}});
@@ -117,4 +123,21 @@ it('a failed local preflight cannot create a remote intent, source or spool',asy
   expect(preflight).toHaveBeenCalledOnce();expect(save).not.toHaveBeenCalled();expect(state.pending).toBeNull();expect(spool.create).not.toHaveBeenCalled();
   expect(()=>b.source()).toThrow('DURABLE_INTENT_REQUIRED');
  }finally{preflight.mockRestore();run.mockRestore();}
+});
+
+it.each([false,true])('the current pipeline does not acquire in a backlog cycle, even if draining succeeds=%s',async drained=>{
+ const save=vi.fn(),state:CorporateCycleState={next:'current',pending:null},binding=createCorporateAttemptsBinding(config(),pin(),cats,state,save,async()=>{});
+ const source=vi.spyOn(binding,'source'),preflight=vi.spyOn(PostgresLargeBatchPersistence.prototype,'preflight');
+ const run=vi.spyOn(ProjectionDispatcher.prototype,'runBatch').mockResolvedValue(0);
+ if(drained)run.mockResolvedValueOnce(1);
+ const pool={query:vi.fn(async(sql:string)=>({rows:sql.includes('count(*)')?[{n:1}]:[],
+  rowCount:sql.includes("state<>'confirmed'")&&!sql.includes('count(*)')&&!drained?1:0}))} as unknown as Pool;
+ const spool={active:vi.fn(async()=>null),create:vi.fn()} as unknown as SpoolRepository;
+ try{
+  const result=createAttemptsPipeline(pool,pool,pool,spool,spoolLimits(),binding).cycle(new AbortController().signal);
+  if(drained)await expect(result).resolves.toEqual({received:0,persisted:0,duplicates:0,rejected:0});
+  else await expect(result).rejects.toThrow('DELIVERY_REQUIRES_RECONCILIATION');
+  expect(source).not.toHaveBeenCalled();expect(save).not.toHaveBeenCalled();expect(preflight).not.toHaveBeenCalled();
+  expect(spool.create).not.toHaveBeenCalled();expect(state.pending).toBeNull();
+ }finally{source.mockRestore();preflight.mockRestore();run.mockRestore();}
 });

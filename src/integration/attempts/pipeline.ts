@@ -9,6 +9,8 @@ import type { OfflineProfile,Catalogs } from '../../offline/model.js';
 import type { CycleCounts } from './runtime-control.js';
 import { AttemptsService,type RuntimePools } from './service.js';
 import {projectionClaimBatchSize} from '../../projection/outbox.js';
+import {isTdsResponseReplay} from '../../olos/tds/source.js';
+import {assertUuid} from '../../persistence/validation.js';
 
 export interface AttemptsBinding {
   // Corporate bindings require registration by the reviewed factory; SELECT adapters remain unavailable.
@@ -22,13 +24,13 @@ export interface AttemptsBinding {
   destinationId:string;mappingVersion:string;sourceNamespace:string;
   profile:OfflineProfile;catalogs:Catalogs;
 }
-export function createAttemptsPipeline(ingest:Pool,project:Pool,receiver:Pool,spool:SpoolRepository,limits:SpoolLimits,binding:AttemptsBinding){
+export function createAttemptsPipeline(ingest:Pool,project:Pool,receiver:Pool,spool:SpoolRepository,limits:SpoolLimits,binding:AttemptsBinding,independentDelivery=false){
   if(binding.kind==='corporate-local')assertCorporateBinding(binding);
   else if(binding.kind!=='isolated-fixture' || binding.tlsVerified!==true || binding.recoveryValidated!==true)throw Error('ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED');
   if(binding.profile.tmaPolicy!=='disabled' || binding.profile.phoneMatchKey!=='normalized')throw Error('DESTINATION_MAPPING_NOT_APPROVED');
   const control=new PostgresPersistence(ingest,{leaseMs:300000});
-  const writer=new PostgresLargeBatchPersistence(ingest,limits,300000,{sourceNamespace:binding.sourceNamespace,destinationId:binding.destinationId,mappingVersion:binding.mappingVersion},binding.deferCheckpointUntilDelivery===true);
-  const coordinator=new LargeBatchCoordinator(control,spool,writer,limits);
+  const writer=new PostgresLargeBatchPersistence(ingest,limits,300000,{sourceNamespace:binding.sourceNamespace,destinationId:binding.destinationId,mappingVersion:binding.mappingVersion},binding.deferCheckpointUntilDelivery===true,independentDelivery);
+  const coordinator=new LargeBatchCoordinator(independentDelivery?{startRun:control.startRun.bind(control),checkpoint:writer.ingestionCheckpoint.bind(writer),renew:control.renew.bind(control),recoverExpired:control.recoverExpired.bind(control)}:control,spool,writer,limits);
   const delivery=isolatedTdsDelivery(project,receiver,binding.destinationId,binding.profile,binding.catalogs,new Date().toISOString().slice(0,-1),true);
   const empty:CycleCounts={received:0,persisted:0,duplicates:0,rejected:0};
   async function drain(signal:AbortSignal){
@@ -42,7 +44,27 @@ export function createAttemptsPipeline(ingest:Pool,project:Pool,receiver:Pool,sp
     const pending=(await project.query(`SELECT 1 FROM olos_export.projection_outbox WHERE destination_id=$1 AND state<>'confirmed' LIMIT 1`,[binding.destinationId])).rowCount;
     if(pending)throw Error('DELIVERY_REQUIRES_RECONCILIATION');return before>0;
   }
-  return {coordinator,async recoverLocal(signal:AbortSignal):Promise<CycleCounts>{
+  async function reconcileLocal(batchId:string,signal:AbortSignal){
+    if(!independentDelivery || signal.aborted)throw Error('STOPPED');assertUuid(batchId);
+    const uncertain=(await project.query<{delivery_id:string}>("SELECT delivery_id FROM olos_export.projection_outbox WHERE destination_id=$1 AND batch_id=$2 AND state='uncertain'",[binding.destinationId,batchId])).rows;
+    for(const row of uncertain){if(signal.aborted)throw Error('STOPPED');if(!await delivery.dispatcher.reconcile(row.delivery_id))throw Error('DELIVERY_REQUIRES_RECONCILIATION');}
+    if((await project.query("SELECT 1 FROM olos_export.projection_outbox WHERE destination_id=$1 AND batch_id=$2 AND state IN ('rejected','uncertain') LIMIT 1",[binding.destinationId,batchId])).rowCount)throw Error('DELIVERY_REQUIRES_RECONCILIATION');
+  }
+  return {coordinator,writer,reconcileLocal,async materializeLocal(signal:AbortSignal):Promise<CycleCounts>{
+    if(!independentDelivery || signal.aborted)throw Error('LOCAL_REPLAY_REQUIRED');
+    if(await spool.active()){
+      const recovered=await coordinator.recover(signal);if(!recovered.result)throw Error('RECOVERY_REQUIRED');return recovered.result;
+    }
+    const source=binding.source();
+    if(!isTdsResponseReplay(source) && !(binding.kind==='isolated-fixture' && source.kind==='synthetic'))throw Error('LOCAL_REPLAY_REQUIRED');
+    return coordinator.receive(binding.plan(),source,signal);
+  },async deliverStep(batchId:string,signal:AbortSignal){
+    await reconcileLocal(batchId,signal);
+    const count=await delivery.dispatcher.runBatch(signal,projectionClaimBatchSize,batchId);
+    const pending=(await project.query("SELECT 1 FROM olos_export.projection_outbox WHERE destination_id=$1 AND batch_id=$2 AND state<>'confirmed' LIMIT 1",[binding.destinationId,batchId])).rowCount;
+    if((await project.query("SELECT 1 FROM olos_export.projection_outbox WHERE destination_id=$1 AND batch_id=$2 AND state IN ('rejected','uncertain') LIMIT 1",[binding.destinationId,batchId])).rowCount)throw Error('DELIVERY_REQUIRES_RECONCILIATION');
+    return {count,complete:!pending};
+  },async recoverLocal(signal:AbortSignal):Promise<CycleCounts>{
     const r=await coordinator.recover(signal);if(r.manifest && !r.result)throw Error('RECOVERY_REQUIRED');await drain(signal);return r.result??empty;
   },async cycle(signal:AbortSignal):Promise<CycleCounts>{
     if(signal.aborted)throw Error('STOPPED');

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type pg from 'pg';
@@ -43,7 +43,54 @@ const rows = async () => (await fixture.admin.query('SELECT payload FROM olos_ex
 const cp = async () => (await fixture.admin.query('SELECT version FROM olos_export.checkpoints')).rows[0]?.version;
 async function expire() { await fixture.admin.query("UPDATE olos_export.source_locks SET lease_until=clock_timestamp()-interval '1 second'"); }
 
+it.each([0,1])('bypassing the service gate leaves two deferred batches with the same expected checkpoint (first=%s)',async first=>{
+  // Synthetic complete empty responses avoid inventing any delivery acknowledgment.
+  // The public service prevents this situation; this demonstrates why removing its gate alone is unsafe.
+  const config={sourceNamespace:'synthetic-checkpoint',destinationId:'synthetic-checkpoint',mappingVersion:'synthetic/v1'};
+  const deferred=new PostgresLargeBatchPersistence(pool,limits,300000,config,true);
+  const second=await LocalSpool.open(join(root,'second-capture'),limits);
+  const manifests:SpoolManifest[]=[];
+  for(const spool of [repo,second]){
+    await coordinator(spool,deferred).receive(largePlan(),rawSource(0),signal());
+    const [id]=await readdir(join(spool.root,'batches'));
+    manifests.push(JSON.parse(await readFile(join(spool.root,'batches',id!,'manifest.json'),'utf8')) as SpoolManifest);
+  }
+  expect(manifests[0]!.identity.streamId).toBe(manifests[1]!.identity.streamId);
+  expect(manifests.map(m=>m.identity.expected.version)).toEqual(['0','0']);
+  expect(await cp()).toBe('0');
+  await deferred.confirmDeliveryCheckpoint(manifests[first]!);
+  expect(await cp()).toBe('1');
+  await expect(deferred.confirmDeliveryCheckpoint(manifests[1-first]!)).rejects.toMatchObject({code:'CHECKPOINT_CONFLICT'});
+  expect(await cp()).toBe('1');
+  expect((await fixture.admin.query('SELECT last_batch_id FROM olos_export.checkpoints')).rows[0].last_batch_id)
+    .toBe(manifests[first]!.identity.batchId);
+});
+
 describe('uma resposta selada, uma transação, uma identidade de recuperação', () => {
+  it('independent materialization adopts a legacy batch and advances only contiguous confirmed deliveries',async()=>{
+    const config={sourceNamespace:'synthetic-checkpoint',destinationId:'synthetic-checkpoint',mappingVersion:'synthetic/v1'};
+    const legacy=new PostgresLargeBatchPersistence(pool,limits,300000,config,true);
+    await coordinator(repo,legacy).receive(largePlan(),rawSource(3),signal());
+    const firstId=(await readdir(join(repo.root,'batches')))[0]!;
+    const first=JSON.parse(await readFile(join(repo.root,'batches',firstId,'manifest.json'),'utf8')) as SpoolManifest;
+    const writer=new PostgresLargeBatchPersistence(pool,limits,300000,config,true,true);
+    const control={startRun:core.startRun.bind(core),checkpoint:writer.ingestionCheckpoint.bind(writer),renew:core.renew.bind(core),recoverExpired:core.recoverExpired.bind(core)};
+    const manifests=[first];
+    for(let n=0;n<2;n++){
+      const spool=await LocalSpool.open(join(root,`new-${n}`),limits);
+      await new LargeBatchCoordinator(control,spool,writer,limits).receive(largePlan(),rawSource(0),signal());
+      const id=(await readdir(join(spool.root,'batches')))[0]!;
+      manifests.push(JSON.parse(await readFile(join(spool.root,'batches',id,'manifest.json'),'utf8')) as SpoolManifest);
+    }
+    expect(manifests.map(m=>m.identity.expected.version)).toEqual(['0','1','2']);
+    await writer.confirmDeliveryCheckpoint(manifests[2]!);await writer.confirmDeliveryCheckpoint(manifests[1]!);
+    expect(await cp()).toBe('0');
+    // Delivery mechanics/receipts are exercised in service-delivery tests. This fixture isolates watermark CAS.
+    await fixture.admin.query("UPDATE olos_export.projection_outbox SET state='confirmed',confirmed_at=clock_timestamp(),attempt_id=gen_random_uuid(),request_payload='{}'::jsonb,request_digest=repeat('0',64) WHERE batch_id=$1",[firstId]);
+    await writer.confirmDeliveryCheckpoint(first);expect(await cp()).toBe('3');
+    await writer.confirmDeliveryCheckpoint(manifests[1]!);expect(await cp()).toBe('3');
+    expect((await fixture.admin.query('SELECT last_batch_id FROM olos_export.checkpoints')).rows[0].last_batch_id).toBe(manifests[2]!.identity.batchId);
+  });
   it('confirma envelope exato, deduplicação global, recibo e checkpoint somente no final', async () => {
     const source = rawSource(7,{ duplicate: true });
     expect(await coordinator().receive(largePlan(),source,signal())).toEqual({ received: 7, persisted: 1, duplicates: 6, rejected: 0 });

@@ -16,10 +16,40 @@ interface RunRow { source_table: SourceContract['source_table']; contract_versio
 /** Uma resposta = uma transação, inclusive staging de chaves, envelopes, recibo e checkpoint. */
 export class PostgresLargeBatchPersistence implements WholeBatchWriter {
   private readonly projection: Readonly<CaptureConfig> | undefined;
-  constructor(private readonly pool: Pick<Pool,'connect'>, private readonly limits: SpoolLimits, private readonly leaseMs = 60_000, projection?: CaptureConfig,private readonly deferCheckpointUntilDelivery=false) {
+  constructor(private readonly pool: Pick<Pool,'connect'>, private readonly limits: SpoolLimits, private readonly leaseMs = 60_000, projection?: CaptureConfig,private readonly deferCheckpointUntilDelivery=false,private readonly independentDelivery=false) {
     this.projection = projection === undefined ? undefined : captureConfig(projection);
     this.limits = spoolLimits(limits);
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 300_000) throw new PersistenceError('VALIDATION_FAILED');
+    if(independentDelivery && (!deferCheckpointUntilDelivery || !this.projection))throw new PersistenceError('VALIDATION_FAILED');
+  }
+  /** Existing committed batch receipts form the ingestion cursor. Delivery's watermark may lag. */
+  private async deliveryTail(client:PoolClient,streamId:string){
+    const cp=(await client.query<{version:string;cursor_value:string|null;last_batch_id:string|null}>(
+      'SELECT version::text,cursor_value,last_batch_id FROM olos_export.checkpoints WHERE stream_id=$1 FOR UPDATE',[streamId])).rows[0];
+    if(!cp)throw new PersistenceError('CHECKPOINT_CONFLICT');
+    const rows=(await client.query<{id:string;expected_version:string;previous_cursor:string|null;next_cursor:string|null;state:string;receipt:boolean;projection:boolean}>(
+      `SELECT b.id,b.expected_version::text,b.previous_cursor,b.next_cursor,b.state,x.batch_id IS NOT NULL AS receipt,p.batch_id IS NOT NULL AS projection
+       FROM olos_export.batches b LEFT JOIN olos_export.large_batch_receipts x ON x.batch_id=b.id
+       LEFT JOIN olos_export.projection_batches p ON p.batch_id=b.id AND p.destination_id=$3
+       WHERE b.stream_id=$1 AND b.expected_version>=$2 ORDER BY b.expected_version,b.id`,[streamId,cp.version,this.projection!.destinationId])).rows;
+    let version=BigInt(cp.version),cursor=cp.cursor_value;
+    for(const row of rows){
+      if(BigInt(row.expected_version)!==version || row.previous_cursor!==cursor)throw new PersistenceError('CHECKPOINT_CONFLICT');
+      if(row.state!=='committed' || !row.receipt || !row.projection)throw new PersistenceError('RECOVERY_REQUIRED');
+      version++;cursor=row.next_cursor;
+    }
+    return {cp,rows,tip:{version:version.toString(),cursor_value:cursor}};
+  }
+  async ingestionCheckpoint(handle:RunHandle){
+    if(!this.independentDelivery || handle.signal.aborted)throw new PersistenceError('VALIDATION_FAILED');
+    assertUuid(handle.streamId);assertUuid(handle.runId);assertVersion(handle.fencingToken);
+    return transaction(this.pool,async c=>{
+      if(!(await c.query(`SELECT 1 FROM olos_export.runs r JOIN olos_export.source_locks l ON l.source_table=r.source_table
+        WHERE r.id=$1 AND r.stream_id=$2 AND r.fencing_token=$3 AND l.generation=$3 AND l.owner_run_id=r.id
+          AND l.lease_until>clock_timestamp() AND r.state IN ('read_intent','persisting') FOR UPDATE OF l NOWAIT`,
+        [handle.runId,handle.streamId,handle.fencingToken])).rowCount)throw new PersistenceError('LEASE_LOST');
+      const {tip}=await this.deliveryTail(c,handle.streamId);return {version:tip.version,cursor:tip.cursor_value};
+    });
   }
   async preflight(plan: LargePlan): Promise<void> {
     await transaction(this.pool,async client => {
@@ -74,7 +104,8 @@ export class PostgresLargeBatchPersistence implements WholeBatchWriter {
         [run.source_table,run.contract_version])).rows[0];
       if (!contract) throw new PersistenceError('CONTRACT_UNCONFIRMED'); assertContract(contract);
       if (canonical(contract) !== canonical(bound.identity.plan.contract)) throw new PersistenceError('CONTRACT_UNCONFIRMED');
-      const cp = (await client.query<{ version: string; cursor_value: string | null }>('SELECT version,cursor_value FROM olos_export.checkpoints WHERE stream_id=$1 FOR UPDATE',[handle.streamId])).rows[0];
+      const cp = this.independentDelivery ? (await this.deliveryTail(client,handle.streamId)).tip :
+        (await client.query<{ version: string; cursor_value: string | null }>('SELECT version,cursor_value FROM olos_export.checkpoints WHERE stream_id=$1 FOR UPDATE',[handle.streamId])).rows[0];
       if (!cp || cp.version !== bound.identity.expected.version || cp.cursor_value !== bound.identity.expected.cursor) throw new PersistenceError('CHECKPOINT_CONFLICT');
       // Uma resposta por run. Não sobrescrever totais de um run que já usou o protocolo anterior.
       const pending = await client.query('SELECT 1 FROM olos_export.batches WHERE run_id=$1',[handle.runId]);
@@ -147,6 +178,19 @@ export class PostgresLargeBatchPersistence implements WholeBatchWriter {
       if(row?.manifest_digest!==manifestDigest(m) || row.state!=='committed')throw new PersistenceError('BATCH_CONFLICT');
       if(!(await c.query('SELECT 1 FROM olos_export.projection_batches WHERE batch_id=$1 AND destination_id=$2',[m.identity.batchId,this.projection!.destinationId])).rowCount ||
         (await c.query("SELECT 1 FROM olos_export.projection_outbox WHERE batch_id=$1 AND destination_id=$2 AND state<>'confirmed' LIMIT 1",[m.identity.batchId,this.projection!.destinationId])).rowCount)throw new PersistenceError('RECOVERY_REQUIRED');
+      if(this.independentDelivery){
+        const {cp,rows}=await this.deliveryTail(c,m.identity.streamId);
+        if(BigInt(cp.version)>BigInt(m.identity.expected.version))return;
+        if(!rows.some(r=>r.id===m.identity.batchId))throw new PersistenceError('CHECKPOINT_CONFLICT');
+        let version=BigInt(cp.version),cursor=cp.cursor_value,last=cp.last_batch_id;
+        for(const batch of rows){
+          if((await c.query("SELECT 1 FROM olos_export.projection_outbox WHERE batch_id=$1 AND destination_id=$2 AND state<>'confirmed' LIMIT 1",[batch.id,this.projection!.destinationId])).rowCount)break;
+          version++;cursor=batch.next_cursor;last=batch.id;
+        }
+        if(version!==BigInt(cp.version))await c.query('UPDATE olos_export.checkpoints SET version=$2,cursor_value=$3,last_batch_id=$4,last_success_at=clock_timestamp() WHERE stream_id=$1',
+          [m.identity.streamId,version.toString(),cursor,last]);
+        return;
+      }
       const cp=(await c.query('SELECT version::text,cursor_value,last_batch_id FROM olos_export.checkpoints WHERE stream_id=$1 FOR UPDATE',[m.identity.streamId])).rows[0];
       if(cp?.last_batch_id===m.identity.batchId)return;
       if(cp?.version!==m.identity.expected.version || cp?.cursor_value!==m.identity.expected.cursor)throw new PersistenceError('CHECKPOINT_CONFLICT');

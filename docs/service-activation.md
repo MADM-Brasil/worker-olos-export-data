@@ -13,7 +13,8 @@ aprovações reais. Não copiar aprovações de fixtures ou de outra operação.
   própria captura/revisão. Não inicia scheduler.
 - `ACTIVE`: ativação persistente vinculada aos dois contratos observados, aos
   recibos de entrega e ao documento de recuperação externo. Um RPC por ciclo;
-  próximo ciclo 120 segundos **após o término** do anterior, sem sobreposição.
+  próximo ciclo 120 segundos **após o handoff durável da captura**, sem esperar
+  a entrega do histórico. Continua sem sobreposição de RPCs.
 - `RECOVERY_REQUIRED`: caso pendente, erro ou requisito revogado/inválido. Uma
   resposta completa pode ser importada localmente; parcial não provoca nova leitura.
 
@@ -31,8 +32,11 @@ cases/<novo-uuid>/capture/               # LocalSpool: bytes TDS, digest e metad
 cases/<novo-uuid>/diagnostic.json        # fases/códigos sanitizados
 cases/<novo-uuid>/contract-candidate.json
 cases/<novo-uuid>/import/                # replay/ingestão local, outro LocalSpool
-cases/<novo-uuid>/delivered.json         # só depois de recibos e checkpoint
-cases/<novo-uuid>/remote-pending.completed.json
+cases/<novo-uuid>/delivered.json         # ACKs de todo o lote; checkpoint contíguo por stream
+cases/<novo-uuid>/remote-pending.completed.json # fluxo serial de bootstrap
+cases/<novo-uuid>/queued.json            # identidade/ordem da fila independente
+cases/<novo-uuid>/remote-pending.captured.json # captura durável, NÃO entrega
+queue-mode.json                         # protocolo de entrega independente
 cycles/<instante>-<uuid>.json            # histórico sanitizado de ciclos
 ```
 
@@ -300,18 +304,18 @@ genérico desabilitado até essa escolha operacional; este trabalho não altera
 Compose, volumes, política de restart ou a VPS.
 
 Depois de uma reinicialização, usar o mesmo comando e volume privado existente;
-não repetir a ativação. O serviço importa primeiro uma captura pendente completa,
-sem RPC. Um pending parcial/incerto suspende o ciclo. Se PostgreSQL estiver
-indisponível ou ocorrer commit sem ACK, preservar tudo: `import-capture` ou uma
-reinicialização com PostgreSQL acessível retoma apenas o lote local, reconciliando
-recibos antes de qualquer nova leitura. Não há retry remoto por erro de conexão.
+não repetir a ativação. A inicialização valida a fila e recupera materializações
+já iniciadas e recibos incertos antes de armar a aquisição. Não espera a entrega
+completa de todos os lotes. Pending parcial/incerto, spool local sem selo, lease
+expirada sem recibo e recibo ausente para entrega incerta continuam bloqueando.
+Não há retry remoto por erro de conexão. Para recuperação sem scheduler, usar
+`recover-queue` conforme o procedimento ao final deste documento.
 
-Uma falha nova com transporte encerrado e instrumentação comprovando que a
-fronteira do driver RPC **não foi alcançada** gera `not-dispatched.json`, vinculado
-ao diagnóstico. Após reiniciar ACTIVE, um ciclo local arquiva esse pending sem
-RPC; uma leitura nova recebe outro UUID num ciclo posterior. Isso não se aplica
-a SIGKILL, diagnóstico ausente, possível handoff, bytes recebidos ou casos antigos.
-O caso LogReadData anterior jamais recebe esse certificado retroativamente.
+Uma tentativa comprovadamente não despachada continua sendo encerrada pelo
+comando explícito `close-not-dispatched` abaixo. O novo start não converte essa
+prova em captura nem em aprovação; exige o encerramento local antes de iniciar.
+Isso não se aplica a SIGKILL, diagnóstico ausente, possível handoff ou bytes
+recebidos. O caso LogReadData anterior não recebe esse certificado retroativamente.
 
 ### Encerramento local de tentativa comprovadamente não despachada
 
@@ -358,17 +362,20 @@ nova captura exige outro comando explícito e todos os requisitos de aquisição
 O modo v2 usa o protocolo existente de ingestão/transações/recibos/outbox, com
 checkpoint adiado: a ingestão e seu recibo são duráveis primeiro, mas a versão do
 checkpoint só muda após todos os ACKs da projeção/destino daquele lote. O avanço
-é idempotente e comparado ao checkpoint esperado. O pending continua cercando
-novas aquisições durante essa janela. Nenhum schema, role ou migration é criado.
+é idempotente e respeita o prefixo confirmado por stream. No start independente,
+o pending cerca a captura até seu handoff durável; a fila passa a representar a
+entrega pendente. Nenhum schema, role ou migration é criado.
 
-O `/status` protegido por token contém estado, última procedure com entrega
-confirmada, tentativa pendente, timestamps reais, erro sanitizado, validade da
+O `/status` protegido por token contém estado, última procedure capturada, fila
+local, tentativa remota pendente, timestamps reais, erro sanitizado, validade da
 aprovação TLS, estado PostgreSQL e próxima execução obtida do scheduler. O status
 por arquivo não abre conexões: indica `NOT_PROBED` para PostgreSQL e próxima
 execução nula. Não representa o estado vivo de um processo remoto.
 
-`imported` no serviço conta registros do último lote com entrega confirmada;
-`duplicates` são duplicatas identificadas na ingestão. Não são uma contagem de
+No fluxo serial, `imported` conta registros do último lote com entrega confirmada;
+`duplicates` são duplicatas identificadas na ingestão. No start independente,
+usar os agregados PostgreSQL e `lastImportConfirmedAt`, pois o ciclo periódico
+mede aquisição. Esses campos não são uma contagem de
 INSERTs novos em raw.olos_calls: a política existente preserva PKs já presentes,
 e não há recibo de contagem de INSERT por linha. `businessRowsInserted=null`
 explicita essa limitação. Outras métricas indisponíveis ficam nulas, não zero.
@@ -376,9 +383,14 @@ explicita essa limitação. Outras métricas indisponíveis ficam nulas, não ze
 A autorização persistente remove a renovação repetitiva; ela não comprova origem,
 layout, semântica PreviousDays, independência de consumidores ou recuperação
 remota. Antes de produção ainda são necessárias as evidências reais da Olos,
-auditoria conclusiva da inspeção pendente e exercício operacional aprovado.
+contratos revisados e exercício operacional aprovado. A inspeção histórica
+LogReadData continua visível e não é condição global de aquisição.
 
 ## Vazão da outbox e atualização com importação pendente
+
+Histórico da otimização `7245077`. Para migrar à fila independente desta entrega,
+seguir o procedimento da seção seguinte; `import-capture` é o fluxo serial e
+não assume uma fila já migrada.
 
 A entrega V2 agrupa até 64 registros do mesmo lote. Claim, autorização, escrita
 no receptor e settle usam uma transação por etapa/grupo. Cada registro conserva
@@ -480,3 +492,201 @@ A carga opt-in acima passou separadamente; ela fica ignorada na suíte padrão.
 Os testes novos cobrem COMMIT sem ACK nas quatro etapas, reinício, fencing,
 recibos repetidos/conflitantes, rollback integral, snapshots persistidos,
 BIGINT/datetime exatos, SIGTERM e compatibilidade entre os dois caminhos.
+
+## Aquisição periódica independente da entrega — implementação local
+
+Implementada sobre `7245077`, sem publicação ou acesso à VPS nesta entrega.
+O caminho serial `serviceCycle()` permanece para compatibilidade/caracterização;
+o `start` V2 usa aquisição e consumidor local separados, no mesmo processo.
+`queue-mode.json` impede que os comandos seriais desta versão assumam uma fila já
+migrada. Não há migration SQL, alteração de grants ou mudança de contratos.
+
+### Funcionamento e garantias
+
+1. O processo mantém o advisory lock `(740219,1)` durante toda a vida dos dois
+   fluxos. O scheduler serializa as RPCs e mantém a alternância CurrentDay /
+   PreviousDays. Continua exigindo ativação e aprovações reais de ambas.
+2. Após resposta integral, validada e selada, verifica bytes/SHA-256, revisão,
+   plano e configuração. Grava `cases/<id>/queued.json` com ordinal e digests,
+   sincroniza, arquiva o pending em `remote-pending.captured.json` e sincroniza
+   os diretórios. Somente então libera o próximo intervalo de 120 segundos.
+   Crash entre essas etapas é retomado localmente; nunca repete a RPC.
+3. Um único consumidor materializa capturas em ordem e usa o dispatcher existente
+   por `batchId`, em grupos de até 64. Três grupos favorecem o lote mais recente;
+   o quarto pertence ao mais antigo. Uma materialização pode demorar, mas não
+   impede aquisição; pode atrasar a primeira entrega de um lote que acabou de chegar.
+4. `batches.expected_version` + recibos de materialização formam a posição de
+   ingestão. O checkpoint existente continua sendo de entrega: avança somente
+   pelo prefixo confirmado **do mesmo stream**. ACK fora de ordem pode gerar
+   `delivered.json` do lote recente sem pular a lacuna no checkpoint. Streams
+   diferentes conservam seus checkpoints separados. Posições duplicadas,
+   lacunas e lotes sem recibo bloqueiam a retomada.
+5. Inserção permanece idempotente (`ON CONFLICT DO NOTHING`). Cada observação
+   tem recibo/digest próprio, mesmo quando a chave de negócio já existe. Não há
+   UPDATE mutável, retry remoto, novo broker ou segundo importador.
+6. A inicialização revalida os casos e recupera materializações iniciadas com a
+   mesma identidade. Consulta os recibos de entregas incertas antes de armar
+   aquisição. Recibo ausente/indeterminado bloqueia; não transforma uncertain em
+   pending. Claims pending respeitam a lease existente. Erro em qualquer fluxo
+   cancela o outro; shutdown aguarda transporte/grupo autorizado antes de liberar
+   o advisory lock. SIGKILL pode exigir reconciliação, sem apagar evidências.
+
+```mermaid
+flowchart LR
+  S[Scheduler serial] --> R[Uma RPC autorizada]
+  R --> C[Captura completa e validada]
+  C --> Q[Fila local com fsync]
+  Q -->|120 segundos| S
+  Q --> I[Materialização FIFO]
+  I --> D[Grupos recentes e históricos]
+  D --> P[INSERT idempotente e recibos]
+  P --> K[Checkpoint do prefixo confirmado]
+```
+
+### Limites de admissão e diagnóstico
+
+Padrão: **8 capturas pendentes**, **8 GiB** de arquivos retidos no diretório de
+serviço. Antes da RPC, reserva mais 512 MiB por captura ainda não materializada e
+1 GiB para a nova captura + replay, além dos 64 MiB mínimos livres do spool.
+O cálculo inclui arquivos retidos de capturas já concluídas. Cada spool continua
+limitado a 512 MiB / 200.000 registros. Não há limpeza automática de evidências.
+Os limites podem ser reduzidos/aumentados explicitamente no comando start:
+`--queue-max-captures` (1–128) e `--queue-max-bytes` (2 GiB–1 TiB).
+Esses parâmetros só controlam capacidade; não substituem nenhuma aprovação.
+
+No limite, não há nova RPC; o consumidor continua. A admissão é reavaliada no
+próximo intervalo. Falha real de armazenamento ou evidência inconsistente exige
+recuperação. Capacidade insuficiente de retenção exige espaço/arquivamento
+operacional aprovado; a implementação não apaga arquivos para prosseguir.
+
+O `/status` autenticado expõe `captureQueue.pending`, `materialized`, `limits`,
+`admission.reason`, `deliveryInFlight`, `lastDurableCaptureId`, `lastProcedure`,
+`lastImportConfirmedAt` e `lastError`, além dos agregados PostgreSQL existentes.
+O `service-status` local também conta a fila. Backlog completo e enfileirado não
+é, por si só, resultado remoto incerto. O intervalo não é promessa de que cada
+lote será entregue em 120 segundos, nem de que a Olos retornará os registros mais
+novos primeiro: a assinatura e o parâmetro `TableName` permanecem iguais.
+
+### Migração do estado preservado (somente após revisão/autorização operacional)
+
+1. Preservar volumes, configuração, aprovações, catálogos e o caso
+   `2393fe49-ef14-45a1-b49e-66d5b089d59f`. Registrar o batchId, hash da captura,
+   contagens da outbox e recibos. Não executar bootstrap/once para substituí-lo.
+2. Parar coordenadamente o importador atual com SIGTERM e aguardar seu término,
+   inclusive se for um processo iniciado por docker exec. Não iniciar outro
+   importador enquanto o proprietário do lock estiver vivo. Para shutdown durante
+   captura, conservar a tolerância necessária para o transporte terminar; uma
+   parada forçada preserva evidências mas pode bloquear a retomada.
+3. Quando autorizada, publicar pelo fluxo GitHub + Dokploy existente, atualizando
+   exclusivamente o worker. Não recriar PostgreSQL, volumes ou configuração. Esta
+   mudança não exige SQL de migração, reaprovação artificial nem zerar checkpoints.
+4. Com o worker automático parado, conferir status na imagem nova:
+
+   ```bash
+   node dist/cli/adapters/attempts-corporate.js service-status \
+     --config "$HOME/.config/olos-worker/attempts-service.json" \
+     --work-dir "$HOME/.local/state/olos-worker/corporate-attempts/service-run"
+   ```
+
+5. **Se ACTIVE e ambas as aprovações estiverem válidas**, iniciar diretamente o
+   processo principal abaixo. Ele adota o pending completo antigo, mantém seu
+   import/batchId/recibos e passa a entregar em background; não exige terminar os
+   200.000 antes da primeira aquisição. Se o estado antigo estiver incerto, a
+   inicialização falha sem nova RPC. Não apagar nem editar a evidência para liberar.
+6. **Se ainda BOOTSTRAP ou se desejar recuperação exclusivamente local**, executar
+   uma única instância deste comando, com o scheduler parado:
+
+   ```bash
+   node dist/cli/adapters/attempts-corporate.js recover-queue \
+     --config "$HOME/.config/olos-worker/attempts-service.json" \
+     --work-dir "$HOME/.local/state/olos-worker/corporate-attempts/service-run" \
+     --confirm LOCAL_RECOVERY_ONLY
+   ```
+
+   Ele valida configuração, autorização e revisões dos casos, usa o mesmo lock,
+   migra/adota o pending completo e drena a fila local. Não conecta à Olos nem
+   inicia scheduler. É repetível após sucesso. Uma lease ainda ativa pode exigir
+   aguardar sua expiração; recibo ausente/incerto exige reconciliação. Não depende
+   de ACTIVE para importar CurrentDay já aprovado; não cria aprovação de PreviousDays.
+
+Comando principal na imagem Dokploy existente, sob o usuário `node` (usar os
+caminhos originais se a instalação tiver nomes diferentes):
+
+```bash
+exec node dist/cli/adapters/attempts-corporate.js start \
+  --config /home/node/.config/olos-worker/attempts-service.json \
+  --work-dir /home/node/.local/state/olos-worker/corporate-attempts/service-run \
+  --interval-ms 120000 \
+  --queue-max-captures 8 \
+  --queue-max-bytes 8589934592
+```
+
+O comando inicia aquisições reais quando autorizado; **não foi executado nesta
+entrega**. Usar como processo principal, nunca como sidecar/cron/docker exec
+concorrente. Manter `SYNC_ENABLED=false` para o boot genérico; a autorização V2 é
+explícita pelo comando, pelo arquivo de ativação e pelos contratos existentes.
+Não configurar Auto Deploy antes da revisão/publicação autorizada.
+
+Critérios de sucesso: hash e batchId originais preservados; nenhuma duplicação
+indevida de chave; contagem de `confirmed` e recibos aumentando; `pending`
+diminuindo para a captura original; capturas novas com queued/arquivo remoto
+sincronizados; dois ciclos registrados separados por pelo menos 120 segundos
+após a captura anterior; um único proprietário do lock; checkpoint sem saltar
+lotes anteriores. Confirmar os totais **por batchId**; o total global de
+`raw.olos_calls` pode incluir outras capturas e deduplicação entre elas.
+
+Rollback: os recibos e tabelas continuam legíveis por `7245077`, mas essa versão
+não conhece a fila nem o cursor independente. **Não fazer rollback com fila
+pendente ou simplesmente remover `queue-mode.json`.** Parar aquisições e drenar
+com `recover-queue` desta versão; só depois revisar uma reversão operacional,
+com todos os checkpoints contíguos e evidências preservadas.
+
+### Testes e limites da validação
+
+Os testes de caracterização do fluxo serial foram mantidos. Os novos cenários
+cobrem handoff antes/depois do registro e rename, corrupção/parcial, adoção de
+importação legada, reinício, recibo confirmado versus ausente, concorrência,
+shutdown, backpressure antes da RPC, prioridade com progresso histórico e
+checkpoint contíguo com entrega fora de ordem.
+
+```bash
+npm test -- --maxWorkers=2 --testTimeout=30000
+npm run typecheck
+npm run build
+git diff --check
+OLOS_PROJECTION_LOAD=1 npm test -- test/independent-delivery-load.test.ts
+```
+
+A carga usa PostgreSQL 16 descartável, 199.744 entregas históricas e 256 recentes,
+200.000 no total. O relatório é `/tmp/olos-independent-delivery-load.json`.
+Confronta linhas, recibos, pendências e digests; não usa credenciais corporativas.
+Os tempos são locais, sem garantia de desempenho da VPS. A comparação de vazão
+unitária/agrupada de `7245077` permanece documentada na seção anterior; esta
+alteração separa os fluxos e modifica a prioridade, sem prometer novo ganho do
+SQL agrupado.
+
+Resultado local da carga em 23/10/2026 (Node 20.20.2 / PostgreSQL 16):
+200.000 linhas, 200.000 recibos confirmados, 200.000 entregas confirmadas,
+zero pendências e zero divergências de digest. As 256 entregas recentes
+terminaram em **272 ms**, antes de concluir o histórico; ao terminar os recentes,
+o histórico já havia progredido de 512 para 576 confirmações. A entrega total
+levou **391,374 s**. Parte do ensaio compartilhou o host com outros testes;
+PostgreSQL usa tmpfs. Resultado preservado em
+[`independent-delivery-load-results.json`](independent-delivery-load-results.json).
+Não comparar esse tempo total com a medição anterior como benchmark de regressão:
+a alteração funcional medida aqui é prioridade/progresso, e a carga concorrente
+no host foi diferente.
+
+Para a suíte completa neste host, usar dois workers de teste e timeout de 30 s.
+O limite padrão de 5 s falhou nos testes TDS que criam dois PostgreSQLs descartáveis
+por caso; esses mesmos casos passaram com 30 s. A primeira execução altamente
+paralela, simultânea à carga, também excedeu a capacidade de inicialização das
+fixtures SQL Server. Isso não altera timeouts do produto, TLS, drivers nem
+asserções dos testes.
+
+Validação final desta entrega: `npm test -- --maxWorkers=2 --testTimeout=30000`
+concluiu com **794 testes aprovados e 5 ignorados**, em 57 arquivos aprovados e
+3 arquivos opcionais ignorados (227,26 s). O teste opt-in de 200.000 entregas foi
+executado e aprovado separadamente. `npm run typecheck`, `npm run build` e
+`git diff --check` também passaram. Nenhum commit, push, deploy, RPC real ou
+alteração no PostgreSQL da VPS foi realizado.

@@ -7,6 +7,8 @@ import {projectTdsAttempts} from '../src/offline/tds-projection.js';
 import {requestDigest} from '../src/projection/request.js';
 import type {DeliveryClaim} from '../src/projection/outbox.js';
 import type {DeliveryRequest} from '../src/projection/dispatcher.js';
+import {PostgresDeliveryTarget} from '../src/projection/postgres-target.js';
+import {IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
 let f:Awaited<ReturnType<typeof projectionLoadFixture>>;
 const signal=()=>new AbortController().signal;
 const states=async()=> (await f.admin.query('SELECT state,count(*)::int n FROM olos_export.projection_outbox GROUP BY state ORDER BY state')).rows;
@@ -196,4 +198,29 @@ it('a rejected projection prevents group authorization while preserving the rema
  await expect(d.dispatcher.runBatch(signal())).rejects.toThrow('DELIVERY_REQUIRES_RECONCILIATION');
  expect(target).not.toHaveBeenCalled();expect(await counts()).toEqual({business:0,receipts:0});
  expect(await states()).toEqual([{state:'pending',n:7},{state:'rejected',n:1}]);
+});
+
+it('a confirmed receipt for a later observation does not imply that preserve-existing updated the business row',async()=>{
+ const d=delivery(),input=requests(await d.outbox.claimBatch(randomUUID(),1))[0]!;
+ const later={...input,deliveryId:randomUUID(),row:{...input.row,olos_call_id:'synthetic-recent'}};
+ later.requestDigest=requestDigest(later.row,later.destinationId,later.contractVersion,later.mappingVersion);
+ expect(await d.target.deliver(input)).toBe('confirmed');
+ expect(await d.target.deliver(later)).toBe('confirmed');
+ expect((await f.admin.query('SELECT olos_call_id FROM raw.olos_calls')).rows[0].olos_call_id).toBe(input.row.olos_call_id);
+ expect(await counts()).toEqual({business:1,receipts:2});
+});
+
+it('the existing mutable writer has no ordering fence: delayed historical delivery can overwrite the recent value',async()=>{
+ // UPDATE is deliberately granted only in the disposable fixture, never in production.
+ await f.admin.query('GRANT UPDATE ON raw.olos_calls TO olos_export_receiver');
+ try{
+  const target=new PostgresDeliveryTarget(f.receiver,f.destinationId,new IsolatedTdsCallsWriter(f.profile,false));
+  const old=requests(await delivery().outbox.claimBatch(randomUUID(),1))[0]!;
+  const recent={...old,deliveryId:randomUUID(),row:{...old.row,olos_call_id:'synthetic-recent'}};
+  recent.requestDigest=requestDigest(recent.row,recent.destinationId,recent.contractVersion,recent.mappingVersion);
+  expect(await target.deliver(recent)).toBe('confirmed');
+  expect(await target.deliver(old)).toBe('confirmed');
+  expect((await f.admin.query('SELECT olos_call_id FROM raw.olos_calls')).rows[0].olos_call_id).toBe(old.row.olos_call_id);
+  expect(await counts()).toEqual({business:1,receipts:2});
+ }finally{await f.admin.query('REVOKE UPDATE ON raw.olos_calls FROM olos_export_receiver');}
 });

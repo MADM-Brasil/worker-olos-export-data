@@ -28,18 +28,19 @@ export async function projectionLoadFixture(){
   const plan=largePlan(),contract=plan.contract;
   await fixture.admin.query('INSERT INTO olos_export.source_contracts(source_table,version,approved,fields,key_fields,layout_evidence,key_evidence) VALUES($1,$2,true,$3,$4,$5,$6)',
    [contract.source_table,contract.version,JSON.stringify(contract.fields),contract.key_fields,contract.layout_evidence,contract.key_evidence]);
-  const seed=async(count:number)=>{
+  const seed=async(count:number,append=false)=>{
    if(!Number.isSafeInteger(count)||count<1||count>200000)throw Error('INVALID_SYNTHETIC_LOAD');
-   const stream=randomUUID(),run=randomUUID(),batch=randomUUID();
-   await fixture.admin.query('TRUNCATE olos_export.streams,olos_export.delivery_receipts,raw.olos_calls CASCADE');
-   await fixture.admin.query("INSERT INTO olos_export.streams(id,source_table,read_type,export_date) VALUES($1,'AttemptsRawData','current_day','2026-01-01')",[stream]);
+   const stream=append?(await fixture.admin.query('SELECT id FROM olos_export.streams LIMIT 1')).rows[0].id as string:randomUUID(),run=randomUUID(),batch=randomUUID();
+   const offset=append?Number((await fixture.admin.query('SELECT coalesce(max(source_key::bigint),0)::text AS n FROM olos_export.projection_outbox')).rows[0].n):0;
+   if(!append)await fixture.admin.query('TRUNCATE olos_export.streams,olos_export.delivery_receipts,raw.olos_calls CASCADE');
+   if(!append)await fixture.admin.query("INSERT INTO olos_export.streams(id,source_table,read_type,export_date) VALUES($1,'AttemptsRawData','current_day','2026-01-01')",[stream]);
    await fixture.admin.query("INSERT INTO olos_export.runs(id,stream_id,source_table,contract_version,fencing_token,state) VALUES($1,$2,'AttemptsRawData',$3,1,'succeeded')",[run,stream,contract.version]);
    await fixture.admin.query("INSERT INTO olos_export.batches(id,run_id,stream_id,source_table,digest,expected_version,state,received_count,persisted_count,committed_at) VALUES($1,$2,$3,'AttemptsRawData',$4,0,'committed',$5,$5,clock_timestamp())",[batch,run,stream,'0'.repeat(64),count]);
    await fixture.admin.query("INSERT INTO olos_export.projection_batches(batch_id,destination_id,source_table,source_namespace,source_contract_version,field_definitions,destination_version,mapping_version,config_digest,snapshot_digest,row_count) VALUES($1,$2,'AttemptsRawData','synthetic',$3,$4,'raw.olos_calls/v1','synthetic-load/v1',$5,$5,$6)",[batch,destinationId,contract.version,JSON.stringify(contract.fields),'0'.repeat(64),count]);
    const payload=decodeWireRow(plan,rawRow(plan));
    const insert={query_timeout:120000,text:`INSERT INTO olos_export.projection_outbox(delivery_id,batch_id,destination_id,source_key,payload)
     SELECT gen_random_uuid(),$1,$2,i::text,$3::jsonb||jsonb_build_object('AttemptsRawDataID',i::text,'CallId',i::text)
-    FROM generate_series(1,$4::integer) AS i`,values:[batch,destinationId,JSON.stringify(payload),count]};
+    FROM generate_series($5::integer+1,$5::integer+$4::integer) AS i`,values:[batch,destinationId,JSON.stringify(payload),count,offset]};
    await fixture.admin.query(insert);
    await fixture.admin.query('ANALYZE olos_export.projection_outbox');return batch;
   };

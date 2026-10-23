@@ -74,6 +74,40 @@ describe('HTTP + actual pipeline with three isolated PostgreSQL logins, no Olos'
    expect((await db.admin.query('SELECT version FROM olos_export.checkpoints')).rows[0].version).toBe('1');
   }finally{await app.close();await second.stop();}
  },15000);
+ it('one lock owner acquires serially while delivery waits; shutdown holds the lock until both flows drain',async()=>{
+  let deliveries=0,activeRpc=0,maxRpc=0,calls=0,release!:()=>void,deliveryAborted=false;
+  const work={initialize:vi.fn(async()=>{}),step:async(signal:AbortSignal)=>{
+   deliveries++;signal.addEventListener('abort',()=>{deliveryAborted=true;},{once:true});await new Promise<void>(r=>{release=r;});return false;
+  }};
+  const runtime=new AttemptsService(pools(),30,async()=>{calls++;maxRpc=Math.max(maxRpc,++activeRpc);await new Promise(r=>setTimeout(r,40));activeRpc--;return counts;},'isolated-fixture',undefined,work);
+  const second=new AttemptsService(pools(),30,async()=>counts,'isolated-fixture',undefined,{initialize:vi.fn(async()=>{}),step:vi.fn(async()=>false)});
+  try{
+   await runtime.start();await until(()=>Number(runtime.snapshot().completedCycles)>=2);
+   expect(calls).toBe(2);expect(deliveries).toBe(1);expect(maxRpc).toBe(1);expect(work.initialize).toHaveBeenCalledOnce();
+   let closed=false;const stopping=runtime.stop().then(()=>{closed=true;});await until(()=>deliveryAborted);expect(closed).toBe(false);
+   await second.start();expect(second.snapshot().state).toBe('blocked');
+   release();await stopping;expect(activeRpc).toBe(0);expect(calls).toBe(2);
+  }finally{release?.();await runtime.stop();await second.stop();}
+ },15000);
+ it('a delivery failure cancels the active acquisition and prevents any automatic consumptive retry',async()=>{
+  let started!:()=>void;const sourceStarted=new Promise<void>(r=>{started=r;});let aborted=false,calls=0;
+  const runtime=new AttemptsService(pools(),10,async signal=>{
+   calls++;started();await new Promise<void>(r=>signal.addEventListener('abort',()=>{aborted=true;r();},{once:true}));throw Error('INCOMPLETE');
+  },'isolated-fixture',undefined,{initialize:async()=>{},step:async()=>{await sourceStarted;throw Error('STORAGE_FAILED');}});
+  try{await runtime.start();await until(()=>aborted);await new Promise(r=>setTimeout(r,60));expect(calls).toBe(1);expect(runtime.snapshot().state).toBe('needs_reconciliation');}
+  finally{await runtime.stop();}
+ },15000);
+ it('a failed acquisition cancels local delivery and initialization failure cannot arm either flow',async()=>{
+  let deliveryCancelled=false,calls=0;
+  const runtime=new AttemptsService(pools(),20,async()=>{calls++;throw Error('INCOMPLETE');},'isolated-fixture',undefined,{
+   initialize:async()=>{},step:async signal=>{await new Promise<void>(r=>signal.addEventListener('abort',()=>{deliveryCancelled=true;r();},{once:true}));return false;}
+  });
+  const source=vi.fn(async()=>counts),step=vi.fn(async()=>false);
+  const refused=new AttemptsService(pools(),20,source,'isolated-fixture',undefined,{initialize:async()=>{throw Error('RECOVERY_REQUIRED');},step});
+  try{await runtime.start();await until(()=>deliveryCancelled);expect(calls).toBe(1);await runtime.stop();
+   await refused.start();await new Promise(r=>setTimeout(r,60));expect(source).not.toHaveBeenCalled();expect(step).not.toHaveBeenCalled();expect(refused.snapshot().armed).toBe(false);
+  }finally{await runtime.stop();await refused.stop();}
+ },15000);
  it('destination failure stops consumption; restart drains pending deliveries locally before another source call',async()=>{
   await db.admin.query("CREATE FUNCTION raw.fail_target() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture destination failure'; END $$;CREATE TRIGGER fail_target BEFORE INSERT ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION raw.fail_target()");
   const source=rawSource(3),spool=await LocalSpool.open(join(dir,'destination-failure'),limits);

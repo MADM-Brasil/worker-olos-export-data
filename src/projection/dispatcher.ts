@@ -31,16 +31,17 @@ export class ProjectionDispatcher {
    * Await the authorized group before returning, including during shutdown.
    * Unstarted claims retain their durable lease and can be reclaimed after expiry.
    */
-  async runBatch(signal: AbortSignal, limit = projectionClaimBatchSize): Promise<number> {
+  async runBatch(signal: AbortSignal, limit = projectionClaimBatchSize, batchId?: string): Promise<number> {
     if (signal.aborted) throw Error('STOPPED');
     if(!Number.isSafeInteger(limit) || limit<1 || limit>projectionClaimBatchSize)throw Error('VALIDATION_FAILED');
     if(!this.target.deliverBatch){
+      if(batchId!==undefined)throw Error('BATCH_TARGET_REQUIRED');
       const state=await this.runOnce();
       if(state!=='empty' && state!=='confirmed')throw Error('DELIVERY_REQUIRES_RECONCILIATION');
       if(signal.aborted)throw Error('STOPPED');
       return state==='empty'?0:1;
     }
-    const claims = await this.outbox.claimBatch(this.owner,limit);
+    const claims = await this.outbox.claimBatch(this.owner,limit,batchId);
     if(claims.length && this.target.deliverBatch){
       const items: {claim:DeliveryClaim;row:Readonly<Candidate>}[]=[];
       for(const claim of claims){

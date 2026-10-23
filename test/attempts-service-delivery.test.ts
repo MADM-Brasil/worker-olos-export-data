@@ -9,12 +9,15 @@ import {fields,response,collation} from './support/activation-capture.js';
 import {LocalSpool} from '../adapters/local-spool.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 import {attemptsFixturePlan,signature} from '../src/integration/attempts/contracts.js';
-import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle} from '../adapters/attempts-service.js';
-import {serviceConfigSchema,type ContractReview} from '../src/integration/attempts/activation.js';
+import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle,createServiceCaptureQueue,observeServiceCapture} from '../adapters/attempts-service.js';
+import {serviceConfigSchema,planForCapture,type ContractReview} from '../src/integration/attempts/activation.js';
 import {exampleProfile,columnTypes} from '../src/offline/model.js';
 import {APPROVED_COLUMNS,IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
 import {digest} from '../src/persistence/validation.js';
 import {IsolatedTdsSource} from '../src/olos/tds/source.js';
+import {PostgresDeliveryTarget} from '../src/projection/postgres-target.js';
+import {ProjectionDispatcher} from '../src/projection/dispatcher.js';
+import {PostgresLargeBatchPersistence} from '../src/persistence/large-batch.js';
 import {InspectionDiagnostics} from '../src/olos/tds/inspection-diagnostics.js';
 let fixture:Awaited<ReturnType<typeof isolatedPostgres>>,root:string,captureDate:string,sequence=0;
 let pools:{ingest:pg.Pool;project:pg.Pool;receiver:pg.Pool};
@@ -43,7 +46,7 @@ async function prepared(version:string,procedure:'ReadDataCurrentDay'|'ReadDataP
  const plan={...template,signature:signature(procedure),fields:fields.map(({sqlLength:_s,collationHex:_c,unicodeMetadataPolicy:_u,...f})=>f) as typeof template.fields,contract:{...template.contract,version},run:{...template.run,contractVersion:version,readType:procedure==='ReadDataCurrentDay'?'current_day' as const:'previous_days' as const,exportDate:controlDate}};
  await fixture.admin.query('INSERT INTO olos_export.source_contracts(source_table,version,approved,fields,key_fields,layout_evidence,key_evidence) VALUES($1,$2,true,$3::jsonb,$4,$5,$6) ON CONFLICT DO NOTHING',[plan.contract.source_table,version,JSON.stringify(plan.contract.fields),plan.contract.key_fields,plan.contract.layout_evidence,plan.contract.key_evidence]);
  const attemptId=randomUUID(),dir=join(root,'cases',attemptId);await mkdir(dir,{recursive:true,mode:0o700});
- const spool=await LocalSpool.open(join(dir,'capture'),spoolLimits()),capture=await spool.createResponseCapture(attemptId);await capture.append(response);const seal=await capture.seal({received:1,fields,responseValidated:true,transportSecurity:[{encrypted:true,identityValidated:true,protocol:'TLSv1.2',tlsMode:'certificate-pinned'}]});
+ const spool=await LocalSpool.open(join(dir,'capture'),spoolLimits()),capture=await spool.createResponseCapture(attemptId);await capture.append(response);const seal=await capture.seal({received:1,fields,responseValidated:true,rawMessageComplete:true,transportSecurity:[{encrypted:true,identityValidated:true,protocol:'TLSv1.2',tlsMode:'certificate-pinned'}]});
  const review:ContractReview={version:'olos-contract-review/v1',procedure,captureId:attemptId,captureSha256:seal.sha256,configurationDigest:loaded.configurationDigest,operator:'test-reviewer',reference:'isolated-source-observation',reviewedAt:new Date().toISOString(),sourceTimeZone:'UTC',controlDayOffset:procedure==='ReadDataCurrentDay'?0:-1,partitionSemanticsEvidence:'isolated control bucket',plan,fields};
  const intent=captureIntentSchema.parse({attemptId,procedure,configurationDigest:loaded.configurationDigest,workDir:root,createdAt:`${captureDate}T10:00:00.000Z`,controlDate,operator:'test',approvalReference:'isolated',pinApprovalId:'unused-local',contractReviewDigest:digest(review),plan,state:'PREPARED'});
  await writeFile(join(root,`attempt-${attemptId}.json`),JSON.stringify(intent),{mode:0o600});return {intent,review,loaded};
@@ -109,4 +112,105 @@ it('ACTIVE promotion requires both real local deliveries and restart replays a c
  expect(await serviceCycle({base,root,configFile:join(root,'config.json'),intervalMs:120000},pools,new AbortController().signal)).toEqual({received:0,persisted:0,duplicates:0,rejected:0,confirmedAt:null,acquisitionPerformed:false});
  expect(JSON.parse(await readFile(join(dir,'not-dispatched-closed.json'),'utf8'))).toEqual(proof);
  expect(JSON.parse(await readFile(join(dir,'remote-pending.not-dispatched.json'),'utf8')).attemptId).toBe(id);
+ // The real acquisition adapter is replaced with a synthetic sealed capture only in this test.
+ let acquisitions=0,release!:()=>void;
+ const syntheticCapture:typeof observeServiceCapture=async(_base,_root,_loaded,_approval,activeGuard,procedure,_signal,review)=>{
+  acquisitions++;activeGuard();if(acquisitions===1)await new Promise<void>(r=>{release=r;});
+  const p=await prepared(review!.plan.contract.version,procedure),createdAt=new Date().toISOString(),plan=planForCapture(review!,new Date(createdAt));
+  p.intent={...p.intent,createdAt,plan,controlDate:plan.run.exportDate,contractReviewDigest:digest(review)};
+  await writeFile(join(root,`attempt-${p.intent.attemptId}.json`),JSON.stringify(p.intent),{mode:0o600});
+  await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:p.intent.attemptId,workDir:root,configurationDigest:p.loaded.configurationDigest}),{mode:0o600});
+  return p.intent;
+ };
+ const options={base,root,configFile:join(root,'config.json'),intervalMs:120000,queueMaxCaptures:2};
+ const queue=createServiceCaptureQueue(options,pools,current.loaded,()=>{},syntheticCapture),signal=new AbortController().signal;
+ await queue.initialize(signal);const inFlight=queue.acquire(signal);
+ for(let n=0;n<200 && !release;n++)await new Promise(r=>setTimeout(r,5));expect(acquisitions).toBe(1);
+ await expect(queue.acquire(signal)).rejects.toThrow('CAPTURE_QUEUE_REQUIRES_REVIEW');release();expect((await inFlight).acquisitionPerformed).toBe(true);
+ const defer=vi.spyOn(ProjectionDispatcher.prototype,'runBatch').mockResolvedValueOnce(0);await queue.step(signal);defer.mockRestore();
+ expect(queue.snapshot().captureQueue.materialized).toBe(1);
+ expect((await queue.acquire(signal)).acquisitionPerformed).toBe(true);expect(acquisitions).toBe(2);
+ expect(queue.snapshot().captureQueue.pending).toBe(2);
+ expect((await queue.acquire(signal)).acquisitionPerformed).toBe(false);expect(acquisitions).toBe(2);
+ expect(queue.snapshot().captureQueue.admission?.reason).toBe('CAPTURE_QUEUE_COUNT_LIMIT');
+ while(queue.snapshot().captureQueue.pending)await queue.step(signal);
+},30000);
+
+async function queuedFixture(version:string){
+ const p=await prepared(version);await reviewServiceContract(root,p.loaded,p.review);
+ const base=join(root,'control');await mkdir(base,{mode:0o700});
+ await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:p.intent.attemptId,workDir:root,configurationDigest:p.loaded.configurationDigest}),{mode:0o600});
+ const options={base,root,configFile:join(root,'config.json'),intervalMs:120000};
+ return {...p,base,options};
+}
+it('queue adopts an interrupted legacy import, preserves its batch/receipts and closes locally without RPC',async()=>{
+ const p=await queuedFixture('queued-legacy/v1');
+ const stop=vi.spyOn(PostgresLargeBatchPersistence.prototype,'confirmDeliveryCheckpoint').mockRejectedValueOnce(Error('simulated shutdown after receipts'));
+ await expect(deliverServiceCapture(root,p.loaded,p.intent,p.review,pools,new AbortController().signal)).rejects.toThrow();stop.mockRestore();
+ const before=(await fixture.admin.query('SELECT id FROM olos_export.batches WHERE run_id IN (SELECT id FROM olos_export.runs WHERE contract_version=$1)',[p.review.plan.contract.version])).rows;
+ const queue=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await queue.initialize(new AbortController().signal);
+ expect(queue.snapshot().captureQueue.pending).toBe(1);
+ expect(JSON.parse(await readFile(join(root,'cases',p.intent.attemptId,'remote-pending.captured.json'),'utf8')).attemptId).toBe(p.intent.attemptId);
+ await expect(readFile(join(p.base,'remote-pending.json'))).rejects.toMatchObject({code:'ENOENT'});
+ const send=vi.spyOn(ProjectionDispatcher.prototype,'runBatch');await queue.step(new AbortController().signal);
+ expect(queue.snapshot().captureQueue.pending).toBe(0);
+ expect((await fixture.admin.query('SELECT id FROM olos_export.batches WHERE run_id IN (SELECT id FROM olos_export.runs WHERE contract_version=$1)',[p.review.plan.contract.version])).rows).toEqual(before);
+ expect(send).toHaveBeenCalledOnce();expect(await send.mock.results[0]!.value).toBe(0);
+ const restart=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await restart.initialize(new AbortController().signal);expect(await restart.step(new AbortController().signal)).toBe(false);
+ await expect(deliverServiceCapture(root,p.loaded,p.intent,p.review,pools,new AbortController().signal)).rejects.toThrow('CAPTURE_QUEUE_RECOVERY_REQUIRED');
+},30000);
+it('queue delivers a recent batch first, keeps the delivery checkpoint at the historical gap, and survives restart',async()=>{
+ const p=await queuedFixture('queued-order/v1'),signal=new AbortController().signal;
+ const first=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await first.initialize(signal);
+ const defer=vi.spyOn(ProjectionDispatcher.prototype,'runBatch').mockResolvedValueOnce(0);await first.step(signal);defer.mockRestore();
+ expect(first.snapshot().captureQueue.pending).toBe(1);
+ const newer=await prepared('queued-order/v1');newer.intent.createdAt=`${captureDate}T10:00:01.000Z`;newer.intent.contractReviewDigest=digest(p.review);
+ await writeFile(join(root,`attempt-${newer.intent.attemptId}.json`),JSON.stringify(newer.intent),{mode:0o600});
+ await writeFile(join(p.base,'remote-pending.json'),JSON.stringify({attemptId:newer.intent.attemptId,workDir:root,configurationDigest:p.loaded.configurationDigest}),{mode:0o600});
+ const second=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await second.initialize(signal);
+ await second.step(signal);expect(second.snapshot().captureQueue.pending).toBe(1);
+ const checkpoint=async()=>(await fixture.admin.query('SELECT version FROM olos_export.checkpoints WHERE stream_id=(SELECT stream_id FROM olos_export.runs WHERE contract_version=$1 LIMIT 1)',[p.review.plan.contract.version])).rows[0].version;
+ expect(await checkpoint()).toBe('0');
+ expect(JSON.parse(await readFile(join(root,'cases',newer.intent.attemptId,'delivered.json'),'utf8')).received).toBe(1);
+ await expect(readFile(join(root,'cases',p.intent.attemptId,'delivered.json'))).rejects.toMatchObject({code:'ENOENT'});
+ const restarted=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await restarted.initialize(signal);
+ const newerPending={attemptId:randomUUID(),workDir:root,configurationDigest:p.loaded.configurationDigest};
+ await writeFile(join(p.base,'remote-pending.json'),JSON.stringify(newerPending),{mode:0o600});
+ await restarted.step(signal);
+ expect(JSON.parse(await readFile(join(p.base,'remote-pending.json'),'utf8'))).toEqual(newerPending);
+ expect(restarted.snapshot().captureQueue.pending).toBe(0);expect(await checkpoint()).toBe('2');
+},30000);
+it.each(['partial','digest'])('queue refuses %s capture evidence without archiving the remote marker',async failure=>{
+ const p=await queuedFixture(`queued-refusal-${failure}/v1`),dir=join(root,'cases',p.intent.attemptId,'capture','batches',p.intent.attemptId);
+ if(failure==='partial'){
+  const path=join(dir,'response.json'),metadata=JSON.parse(await readFile(path,'utf8'));metadata.rawMessageComplete=false;await writeFile(path,JSON.stringify(metadata),{mode:0o600});
+ }else await writeFile(join(dir,'response.ready'),Buffer.from('corrupt'),{mode:0o600});
+ const queue=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await expect(queue.initialize(new AbortController().signal)).rejects.toThrow();
+ expect(JSON.parse(await readFile(join(p.base,'remote-pending.json'),'utf8')).attemptId).toBe(p.intent.attemptId);
+ await expect(queue.acquire(new AbortController().signal)).rejects.toThrow('CAPTURE_QUEUE_REQUIRES_REVIEW');
+});
+
+it('queue restart reconciles confirmed receipts, but absent receipts block before acquisition and are never resent',async()=>{
+ for(const committed of [true,false]){
+  const p=await queuedFixture(`queued-unknown-${committed}/v1`),signal=new AbortController().signal;
+  const queue=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await queue.initialize(signal);
+  const connect=pools.receiver.connect.bind(pools.receiver);let lost=false;
+  const send=vi.spyOn(pools.receiver,'connect').mockImplementation((async()=>{
+   const client=await connect();return new Proxy(client,{get(target,key){if(key==='query')return async(sql:string,...args:unknown[])=>{
+    if(sql==='COMMIT' && !lost){lost=true;if(committed)await target.query('COMMIT');else await target.query('ROLLBACK');throw Error('simulated missing ACK');}
+    return (target.query as (...a:unknown[])=>Promise<unknown>).call(target,sql,...args);
+   };const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;}});
+  }) as typeof pools.receiver.connect);
+  await expect(queue.step(signal)).rejects.toThrow('DELIVERY_REQUIRES_RECONCILIATION');expect(lost).toBe(true);send.mockRestore();
+  await expect(queue.acquire(signal)).rejects.toThrow('RECOVERY_REQUIRED');
+  const before=(await fixture.admin.query("SELECT count(*)::int AS n FROM olos_export.projection_events WHERE event='dispatch_authorized'")).rows[0].n;
+  const receiptReads=vi.spyOn(PostgresDeliveryTarget.prototype,'receipt');
+  const restarted=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});
+  if(committed){await restarted.initialize(signal);await restarted.step(signal);expect(restarted.snapshot().captureQueue.pending).toBe(0);}
+  else {await expect(restarted.initialize(signal)).rejects.toThrow('DELIVERY_REQUIRES_RECONCILIATION');await expect(restarted.acquire(signal)).rejects.toThrow('CAPTURE_QUEUE_REQUIRES_REVIEW');}
+  expect(receiptReads).toHaveBeenCalledOnce();receiptReads.mockRestore();
+  expect((await fixture.admin.query("SELECT count(*)::int AS n FROM olos_export.projection_events WHERE event='dispatch_authorized'")).rows[0].n).toBe(before);
+  // Reuse this test's filesystem only after the first confirmed exercise has been preserved in PostgreSQL.
+  if(committed){await rm(root,{recursive:true,force:true});root=await mkdtemp(join(tmpdir(),'olos-service-delivery-'));}
+ }
 },30000);
