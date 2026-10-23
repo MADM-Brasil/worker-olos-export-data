@@ -307,6 +307,55 @@ async function withLocalLock<T>(options:ServiceOptions,operation:(pools:RuntimeP
   await probe.probe();if(!allowLocalRecovery && probe.snapshot().recoveryPending)throw Error('RECOVERY_REQUIRED');return await operation(pools,abort.signal);
  }finally{process.removeListener('SIGINT',cancel);process.removeListener('SIGTERM',cancel);if(lock){await lock.query('SELECT pg_advisory_unlock(740219,1)').catch(()=>{});lock.release(true);}await probe.stop();}
 }
+/** Caller holds the existing instance lock. Closure never authorizes or performs acquisition. */
+async function closeNotDispatchedServiceCase(options:ServiceOptions,attemptId:string,configurationDigest:string,guard:()=>void,signal:AbortSignal){
+ const assertCurrent=()=>{guard();if(signal.aborted)throw Error('ABORTED');};
+ assertCurrent();if(!z.string().uuid().safeParse(attemptId).success)throw Error('RECOVERY_REQUIRED');
+ const {base,root}=options,dir=join(root,'cases',attemptId),pendingPath=join(base,'remote-pending.json'),archive=join(dir,'remote-pending.not-dispatched.json'),closed=join(dir,'not-dispatched-closed.json');
+ const pendingExists=await serviceExists(pendingPath);
+ if(!pendingExists && !await serviceExists(archive))throw Error('NO_PENDING_CAPTURE');
+ const markerPath=pendingExists?pendingPath:archive;
+ const marker=await privateJson(markerPath) as {attemptId?:string;workDir?:string;configurationDigest?:string};
+ if(marker.attemptId!==attemptId || marker.workDir!==root || marker.configurationDigest!==configurationDigest)throw Error('RECOVERY_REQUIRED');
+ const intentPath=join(root,`attempt-${attemptId}.json`),intent=captureIntentSchema.parse(await privateJson(intentPath));
+ if(intent.attemptId!==attemptId || intent.workDir!==root || intent.configurationDigest!==configurationDigest)throw Error('RECOVERY_REQUIRED');
+ await privateDirectory(dir);
+ const proofPath=join(dir,'not-dispatched.json'),diagnosticPath=join(dir,'diagnostic.json');
+ const proof=await privateJson(proofPath) as {kind?:string;attemptId?:string;diagnosticDigest?:string;evidence?:string};
+ const diagnostic=await privateJson(diagnosticPath) as {attemptId?:string;rpcDispatchState?:string;remoteExecutionOutcome?:string;observedStages?:unknown};
+ if(proof.kind!=='olos-local-not-dispatched/v1' || proof.attemptId!==attemptId || proof.evidence!=='CONTROLLED_RPC_HANDOFF_NOT_REACHED_AFTER_TRANSPORT_CLOSED' ||
+  proof.diagnosticDigest!==digest(diagnostic) || diagnostic.attemptId!==attemptId || diagnostic.rpcDispatchState!=='NOT_OBSERVED' || diagnostic.remoteExecutionOutcome!=='NOT_OBSERVED' ||
+  !Array.isArray(diagnostic.observedStages) || diagnostic.observedStages.some(stage=>typeof stage!=='string' || ['RPC_HANDOFF_STARTED','RPC_HANDOFF_RETURNED','RESPONSE_CAPTURE_STARTED','RESPONSE_VALIDATION_STARTED','RESPONSE_VALIDATED'].includes(stage)))throw Error('RECOVERY_REQUIRED');
+ const captureDir=join(dir,'capture','batches',attemptId);await privateDirectory(captureDir);
+ if(await serviceExists(join(captureDir,'response.ready')))throw Error('RECOVERY_REQUIRED');
+ if(pendingExists && await serviceExists(archive))throw Error('RECOVERY_REQUIRED');
+ const assertEvidence=()=>{
+  assertCurrent();
+  for(const [path,value] of [[markerPath,marker],[intentPath,intent],[proofPath,proof],[diagnosticPath,diagnostic]] as const)
+   if(digest(privateServiceJsonSync(path))!==digest(value))throw Error('RECOVERY_REQUIRED');
+  if(pendingExists && existsSync(archive))throw Error('RECOVERY_REQUIRED'); // Never overwrite archived evidence.
+  if(existsSync(closed) && digest(privateServiceJsonSync(closed))!==digest(proof))throw Error('RECOVERY_REQUIRED');
+  if(existsSync(join(captureDir,'response.ready')))throw Error('RECOVERY_REQUIRED');
+  const fd=openSync(join(captureDir,'response.partial'),constants.O_RDONLY|constants.O_NOFOLLOW);
+  try{const st=fstatSync(fd);if(!st.isFile() || st.uid!==process.getuid?.() || st.mode&0o077 || st.size!==0)throw Error('RECOVERY_REQUIRED');}finally{closeSync(fd);}
+  const descriptor=join(captureDir,'response.json');if(existsSync(descriptor)){
+   const response=privateServiceJsonSync(descriptor) as {attemptId?:string;state?:string;bytes?:number};
+   if(response.attemptId!==attemptId || response.state!=='incomplete' || response.bytes!==0)throw Error('RECOVERY_REQUIRED');
+  }
+ };
+ assertEvidence();
+ if(await serviceExists(closed)){
+  if(digest(await privateJson(closed))!==digest(proof))throw Error('RECOVERY_REQUIRED');
+ }else{
+  if(!pendingExists)throw Error('RECOVERY_REQUIRED');
+  assertEvidence();await durableExclusive(closed,proof);
+ }
+ assertEvidence();
+ if(pendingExists)await rename(pendingPath,archive);
+ await syncDir(base);await syncDir(dir);
+ return {attemptId,alreadyClosed:!pendingExists};
+}
+
 export async function serviceCycle(options:ServiceOptions,pools:RuntimePools,signal:AbortSignal){
  const {loaded,approval,guard}=await serviceAuthorization(options);guard();const reviews=await assertActive(options,loaded,approval);
  const activation=await privateJson(join(options.root,'activation.json')) as {recoveryEvidence:string;recoveryDigest:string};
@@ -316,11 +365,7 @@ export async function serviceCycle(options:ServiceOptions,pools:RuntimePools,sig
  let acquired=false;
  let pending=await pendingServiceCase(options.base,options.root);
  if(pending && await serviceExists(join(options.root,'cases',pending.attemptId,'not-dispatched.json'))){
-  const dir=join(options.root,'cases',pending.attemptId),proof=await privateJson(join(dir,'not-dispatched.json')) as {attemptId:string;diagnosticDigest:string;kind:string};
-  const diagnostic=await privateJson(join(dir,'diagnostic.json')) as {rpcDispatchState:string;observedStages:string[]};
-  if(proof.kind!=='olos-local-not-dispatched/v1' || proof.attemptId!==pending.attemptId || proof.diagnosticDigest!==digest(diagnostic) || diagnostic.rpcDispatchState!=='NOT_OBSERVED' || diagnostic.observedStages.includes('RESPONSE_CAPTURE_STARTED'))throw Error('RECOVERY_REQUIRED');
-  await durableExclusive(join(dir,'not-dispatched-closed.json'),proof);
-  await rename(join(options.base,'remote-pending.json'),join(dir,'remote-pending.not-dispatched.json'));await syncDir(options.base);await syncDir(dir);
+  await closeNotDispatchedServiceCase(options,pending.attemptId,loaded.configurationDigest,activeGuard,signal);
   return {received:0,persisted:0,duplicates:0,rejected:0,confirmedAt:null,acquisitionPerformed:false};
  }
  if(!pending){
@@ -347,6 +392,10 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
  await directories(options.base,options.root);
  if(action==='reconcile-inspection')return reconcileServiceInspection(options.base,await privateJson(flags['--decision-file']!));
  const {loaded,approval,guard}=await serviceAuthorization(options);guard();
+ if(action==='close-not-dispatched')return withLocalLock(options,async(_pools,signal)=>({
+  event:'service_not_dispatched_closed',...await closeNotDispatchedServiceCase(options,flags['--attempt-id']!,loaded.configurationDigest,guard,signal),
+  acquisitionPerformed:false,schedulerStarted:false,retryRemote:false
+ }),true);
  if(action==='bootstrap'){
   const procedure=z.enum(acquisitionProcedures).parse(flags['--procedure']);
   if(await serviceExists(join(options.root,'activation.json')))throw Error('ALREADY_ACTIVE');

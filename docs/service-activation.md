@@ -313,6 +313,46 @@ RPC; uma leitura nova recebe outro UUID num ciclo posterior. Isso não se aplica
 a SIGKILL, diagnóstico ausente, possível handoff, bytes recebidos ou casos antigos.
 O caso LogReadData anterior jamais recebe esse certificado retroativamente.
 
+### Encerramento local de tentativa comprovadamente não despachada
+
+Em `BOOTSTRAP` também é possível executar explicitamente a mesma rotina de
+encerramento usada por `serviceCycle()`, sem ativar o serviço:
+
+```bash
+npm run worker:attempts -- close-not-dispatched \
+  --config "$HOME/.config/olos-worker/attempts-service.json" \
+  --work-dir "$HOME/.local/state/olos-worker/corporate-attempts/service-run" \
+  --attempt-id 9a559499-47e9-4306-afa4-6b1127a538eb
+```
+
+Executar no ambiente/container do worker com esta versão instalada, sob o mesmo
+usuário e com os volumes privados existentes. Os caminhos acima são os exemplos
+deste documento: usar os caminhos da instalação e da tentativa, sem criar uma
+nova configuração ou diretório para contornar validações.
+
+O comando exige UUID, configuração/autorização válidas, destino PostgreSQL
+coincidente, probe do runtime e o lock de instância `(740219,1)`. Não depende de
+`ACTIVE`, contratos revisados ou aprovação TLS para essa operação local. Não
+conecta à Olos, executa RPC, inicia scheduler ou repete a aquisição.
+
+Antes de escrever, confere o UUID na intenção, no pending, no diagnóstico e na
+prova `not-dispatched.json`, além do digest canônico do diagnóstico. Exige
+`rpcDispatchState=NOT_OBSERVED`, resultado remoto não observado, ausência de
+handoff/captura/validação de resposta e spool parcial vazio, sem resposta selada.
+Evidência ausente, adulterada, contraditória ou resposta parcial mantém o bloqueio.
+
+Preserva os arquivos existentes e cria `cases/<UUID>/not-dispatched-closed.json`
+exclusivamente. Arquiva `remote-pending.json` como
+`cases/<UUID>/remote-pending.not-dispatched.json`, com sincronização durável dos
+diretórios. Não altera `remote-state.json`, diagnósticos, bytes ou decisões
+históricas. Uma repetição revalida as evidências arquivadas e retorna
+`alreadyClosed=true`; a presença de outra tentativa pendente impede a repetição.
+
+O resultado é `event=service_not_dispatched_closed`, com
+`acquisitionPerformed=false`, `schedulerStarted=false` e `retryRemote=false`.
+O serviço permanece em `BOOTSTRAP` quando ainda não foi ativado. Uma eventual
+nova captura exige outro comando explícito e todos os requisitos de aquisição.
+
 ## Checkpoints, métricas e limites
 
 O modo v2 usa o protocolo existente de ingestão/transações/recibos/outbox, com

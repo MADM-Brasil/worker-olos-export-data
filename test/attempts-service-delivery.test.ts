@@ -15,6 +15,7 @@ import {exampleProfile,columnTypes} from '../src/offline/model.js';
 import {APPROVED_COLUMNS,IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
 import {digest} from '../src/persistence/validation.js';
 import {IsolatedTdsSource} from '../src/olos/tds/source.js';
+import {InspectionDiagnostics} from '../src/olos/tds/inspection-diagnostics.js';
 let fixture:Awaited<ReturnType<typeof isolatedPostgres>>,root:string,captureDate:string,sequence=0;
 let pools:{ingest:pg.Pool;project:pg.Pool;receiver:pg.Pool};
 beforeAll(async()=>{
@@ -95,4 +96,17 @@ it('ACTIVE promotion requires both real local deliveries and restart replays a c
  const result=await serviceCycle({base,root,configFile:join(root,'config.json'),intervalMs:120000},pools,new AbortController().signal);
  expect(result.received).toBe(1);expect(result.acquisitionPerformed).toBe(false);
  expect(JSON.parse(await readFile(join(root,'cases',pending.intent.attemptId,'remote-pending.completed.json'),'utf8')).attemptId).toBe(pending.intent.attemptId);
+ // ACTIVE uses the same local closure as the administrative BOOTSTRAP command.
+ const id=randomUUID(),dir=join(root,'cases',id),intent={...pending.intent,attemptId:id};
+ await mkdir(dir,{mode:0o700});
+ const spool=await LocalSpool.open(join(dir,'capture'),spoolLimits()),capture=await spool.createResponseCapture(id);await capture.interrupt();
+ const diagnostic={attemptId:id,...new InspectionDiagnostics().snapshot()};
+ const proof={kind:'olos-local-not-dispatched/v1',attemptId:id,diagnosticDigest:digest(diagnostic),evidence:'CONTROLLED_RPC_HANDOFF_NOT_REACHED_AFTER_TRANSPORT_CLOSED'};
+ await writeFile(join(root,`attempt-${id}.json`),JSON.stringify(intent),{mode:0o600});
+ await writeFile(join(dir,'diagnostic.json'),JSON.stringify(diagnostic),{mode:0o600});
+ await writeFile(join(dir,'not-dispatched.json'),JSON.stringify(proof),{mode:0o600});
+ await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:id,workDir:root,configurationDigest:pending.loaded.configurationDigest}),{mode:0o600});
+ expect(await serviceCycle({base,root,configFile:join(root,'config.json'),intervalMs:120000},pools,new AbortController().signal)).toEqual({received:0,persisted:0,duplicates:0,rejected:0,confirmedAt:null,acquisitionPerformed:false});
+ expect(JSON.parse(await readFile(join(dir,'not-dispatched-closed.json'),'utf8'))).toEqual(proof);
+ expect(JSON.parse(await readFile(join(dir,'remote-pending.not-dispatched.json'),'utf8')).attemptId).toBe(id);
 },30000);
