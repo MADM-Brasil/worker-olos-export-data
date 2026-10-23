@@ -1,0 +1,42 @@
+{
+  "node": "20.20.2",
+  "postgres": "16",
+  "poolConnections": {
+    "project": 2,
+    "receiver": 2
+  },
+  "claimBatchSize": 64,
+  "baselineScope": "first 1024 deliveries from 200000 pending; not a complete baseline run",
+  "metrics": [
+    {
+      "mode": "runOnce",
+      "queueRows": 200000,
+      "delivered": 1024,
+      "milliseconds": 63451,
+      "rowsPerSecond": 16,
+      "peakHeap": 32554776,
+      "peakRss": 102813696
+    },
+    {
+      "mode": "runBatch",
+      "queueRows": 200000,
+      "delivered": 1024,
+      "milliseconds": 1473,
+      "rowsPerSecond": 695,
+      "peakHeap": 46172392,
+      "peakRss": 126054400
+    },
+    {
+      "mode": "runBatch-complete",
+      "queueRows": 200000,
+      "delivered": 200000,
+      "milliseconds": 327897,
+      "rowsPerSecond": 610,
+      "peakHeap": 46172392,
+      "peakRss": 126054400
+    }
+  ],
+  "speedup": 43.08,
+  "verifiedOptimizedRows": 200000,
+  "productionAccessed": false
+}

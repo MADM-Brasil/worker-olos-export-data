@@ -24,7 +24,17 @@ export const APPROVED_COLUMNS = [
 ] as const;
 
 export class IsolatedTdsCallsWriter implements TransactionalBusinessWriter {
-  constructor(private readonly profile: OfflineProfile,private readonly preserveExisting=false) {}
+  readonly writeBatchInTransaction?: (client:PoolClient,requests:readonly DeliveryRequest[])=>Promise<void>;
+  constructor(private readonly profile: OfflineProfile,private readonly preserveExisting=false) {
+    // Only the existing insert/preserve policy is batched. Other writers keep their single-row path.
+    if(preserveExisting)this.writeBatchInTransaction=async(client,requests)=>{
+      if(requests.some(r=>this.preflight(r.row)!=='allowed'))throw Error('ISOLATED_TDS_ROW_REJECTED');
+      const columns=this.profile.columns.map(c=>`"${c}"`).join(',');
+      await client.query(`INSERT INTO raw.olos_calls (${columns})
+        SELECT ${columns} FROM jsonb_populate_recordset(NULL::raw.olos_calls,$1::jsonb)
+        ON CONFLICT (internal_id_olos) DO NOTHING`,[JSON.stringify(requests.map(r=>r.row))]);
+    };
+  }
 
   preflight(row: Readonly<Candidate>): 'allowed' | 'rejected' {
     const columns = this.profile.columns;

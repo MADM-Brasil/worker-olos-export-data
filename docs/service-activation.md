@@ -377,3 +377,106 @@ A autorização persistente remove a renovação repetitiva; ela não comprova o
 layout, semântica PreviousDays, independência de consumidores ou recuperação
 remota. Antes de produção ainda são necessárias as evidências reais da Olos,
 auditoria conclusiva da inspeção pendente e exercício operacional aprovado.
+
+## Vazão da outbox e atualização com importação pendente
+
+A entrega V2 agrupa até 64 registros do mesmo lote. Claim, autorização, escrita
+no receptor e settle usam uma transação por etapa/grupo. Cada registro conserva
+seu delivery_id, request_digest, snapshot da requisição, generation, attempt_id,
+recibo e eventos individuais. Os grupos são sequenciais, dentro do lock de
+instância existente `(740219,1)`; não são criados importadores paralelos nem
+aumentados os pools. Destinos sem suporte a escrita agrupada continuam no caminho
+unitário. `runOnce()` permanece compatível.
+
+Não há migration, índice novo, alteração de grants, formato de spool, contrato,
+aprovação ou estado persistido. O destino continua em `ON CONFLICT DO NOTHING`.
+O checkpoint continua condicionado à entrega integral confirmada, inclusive
+quando uma importação é retomada com milhares de registros já confirmados.
+
+Um erro SQL no receptor reverte recibos e linhas de todo o grupo. Um COMMIT sem
+ACK deixa o resultado incerto: o replay local consulta os recibos individuais e
+não reenvia a entrega incerta. Ausência de recibo não é autorização de retry.
+Uma interrupção pode deixar até 64 claims; claims ainda pending são retomáveis
+após a lease existente expirar. Autorizações incertas continuam bloqueadas sem
+recibo conclusivo. SIGTERM termina o grupo já autorizado antes de retornar;
+um SIGKILL preserva as mesmas regras duráveis, mas pode exigir reconciliação.
+
+Procedimento para atualização futura autorizada (não executado nesta entrega):
+
+1. Registrar o captureId/pending, os hashes e o batchId existentes. Preservar
+   integralmente os volumes de estado, o banco, a configuração e os catálogos.
+2. Enviar SIGTERM ao processo que está importando e aguardar seu encerramento.
+   Se a importação foi iniciada por docker exec, sinalizar esse processo, não
+   apenas o HTTP genérico. Não iniciar outro importador enquanto ele estiver vivo.
+3. Publicar a correção pelo fluxo GitHub + Dokploy: commit/push autorizados para
+   `MADM-Brasil/worker-olos-export-data`, branch `main`, e deploy do serviço
+   existente no Dokploy. Antes do push, conferir Auto Deploy e o comando de
+   deploy; não permitir que o comando padrão recrie também o PostgreSQL.
+   Usar o comando customizado do Dokploy, com projeto e caminho existentes:
+
+   ```text
+   compose -p <PROJETO_EXISTENTE> -f <COMPOSE_PATH_EXISTENTE> up -d --build --no-deps worker
+   ```
+
+   Conferir o commit no checkout do Dokploy e os módulos compilados da imagem.
+   Não recriar o PostgreSQL/volumes, apagar pending, recriar spool, gerar outro
+   captureId ou executar novamente bootstrap/once para substituir esta captura.
+4. Antes do scheduler, executar `service-status` com a configuração e work-dir
+   originais. Verificar o mesmo pending. Claims remanescentes podem exigir aguardar
+   o lease_until original; não editar leases ou marcar uncertain como pending.
+5. Retomar exclusivamente a captura local, com o serviço automático parado:
+
+   ```bash
+   SYNC_ENABLED=false npm run worker:attempts -- import-capture \
+     --config "$HOME/.config/olos-worker/attempts-service.json" \
+     --work-dir "$HOME/.local/state/olos-worker/corporate-attempts/service-run" \
+     --confirm LOCAL_RECOVERY_ONLY
+   ```
+
+6. Conferir `delivered.json`, batchId, captureSha256/reviewDigest, recibos, outbox
+   confirmada e checkpoint; o comando arquiva o pending somente após confirmação.
+   Se houver uncertain sem recibo ou falha, preservar o caso e investigar; não
+   repetir a aquisição. Só então retomar o comando V2 de start já autorizado.
+
+O caminho unitário anterior consegue ler os estados/recibos criados pelo caminho
+agrupado. Um rollback de imagem, se necessário, também exige parar o importador
+anterior e conservar o mesmo estado. A compatibilidade não elimina a obrigação
+de reconciliar COMMIT desconhecido.
+
+Validação de carga reproduzível, exclusivamente em PostgreSQL sintético descartável:
+
+```bash
+OLOS_PROJECTION_LOAD=1 npm test -- test/projection-throughput.test.ts
+```
+
+O ensaio cria uma fila de 200.000 registros para cada caminho. Compara o mesmo
+prefixo de 1.024 entregas pelo runOnce anterior e pelo caminho agrupado; o caminho
+novo também conclui os 200.000 e confere linhas, recibos, estados, eventos e
+digests. O tempo completo do caminho antigo não é medido nem extrapolado como
+resultado real. O relatório sanitizado fica em `/tmp/olos-projection-throughput.json`.
+Os pools de projeção/receptor têm duas conexões, como no runtime. O PostgreSQL
+de teste usa tmpfs; os números não são garantia de vazão da VPS. O scheduler
+continua aguardando 120 segundos após o término do ciclo, sem prometer que
+200.000 entregas terminem em 120 segundos.
+
+Resultado local de 23/10/2026, Node 20.20.2 / PostgreSQL 16, sem acesso à produção:
+
+| Caminho | Entregas medidas | Tempo | Vazão |
+| --- | ---: | ---: | ---: |
+| Anterior, fila inicial de 200.000 | 1.024 | 63,451 s | 16 registros/s |
+| Agrupado, fila inicial de 200.000 | 1.024 | 1,473 s | 695 registros/s |
+| Agrupado, fila completa | 200.000 | 327,897 s | 610 registros/s |
+
+Ganho de 43,08 vezes na janela comparável. Os 200.000 registros terminaram com
+200.000 recibos confirmados, 200.000 entregas confirmadas, 600.000 eventos e zero
+divergências de digest. O pico de RSS do processo de teste foi de 126.054.400 bytes
+no caminho agrupado; não inclui memória do PostgreSQL. O ensaio não mede a captura
+TDS, a preparação da outbox ou o ciclo completo. Os dados brutos sanitizados estão
+em [projection-throughput-results.json](projection-throughput-results.json).
+
+Verificações desta alteração: `npm test -- --maxWorkers=2` (770 testes passaram,
+4 ignorados), `npm run typecheck`, `npm run build` e `git diff --check` passaram.
+A carga opt-in acima passou separadamente; ela fica ignorada na suíte padrão.
+Os testes novos cobrem COMMIT sem ACK nas quatro etapas, reinício, fencing,
+recibos repetidos/conflitantes, rollback integral, snapshots persistidos,
+BIGINT/datetime exatos, SIGTERM e compatibilidade entre os dois caminhos.

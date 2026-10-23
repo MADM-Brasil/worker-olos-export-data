@@ -8,6 +8,7 @@ import { isolatedTdsDelivery } from '../../offline/tds-delivery.js';
 import type { OfflineProfile,Catalogs } from '../../offline/model.js';
 import type { CycleCounts } from './runtime-control.js';
 import { AttemptsService,type RuntimePools } from './service.js';
+import {projectionClaimBatchSize} from '../../projection/outbox.js';
 
 export interface AttemptsBinding {
   // Corporate bindings require registration by the reviewed factory; SELECT adapters remain unavailable.
@@ -34,7 +35,10 @@ export function createAttemptsPipeline(ingest:Pool,project:Pool,receiver:Pool,sp
     const uncertain=(await project.query<{delivery_id:string}>(`SELECT delivery_id FROM olos_export.projection_outbox WHERE destination_id=$1 AND state='uncertain'`,[binding.destinationId])).rows;
     for(const row of uncertain){if(signal.aborted)throw Error('STOPPED');await delivery.dispatcher.reconcile(row.delivery_id);}
     const before=(await project.query(`SELECT count(*)::int AS n FROM olos_export.projection_outbox WHERE destination_id=$1 AND state<>'confirmed'`,[binding.destinationId])).rows[0].n;
-    for(let i=0;i<limits.maxRows;i++){if(signal.aborted)throw Error('STOPPED');const r=await delivery.dispatcher.runOnce();if(r==='empty')break;if(r!=='confirmed')throw Error('DELIVERY_REQUIRES_RECONCILIATION');}
+    for(let delivered=0;delivered<limits.maxRows;){
+      const count=await delivery.dispatcher.runBatch(signal,Math.min(projectionClaimBatchSize,limits.maxRows-delivered));
+      if(!count)break;delivered+=count;
+    }
     const pending=(await project.query(`SELECT 1 FROM olos_export.projection_outbox WHERE destination_id=$1 AND state<>'confirmed' LIMIT 1`,[binding.destinationId])).rowCount;
     if(pending)throw Error('DELIVERY_REQUIRES_RECONCILIATION');return before>0;
   }

@@ -17,6 +17,7 @@ export interface DeliveryMessage {
 }
 export interface DeliveryClaim { readonly id: string; readonly owner: string; readonly token: string; readonly message: DeliveryMessage; }
 export type Receipt = 'confirmed' | 'rejected' | 'absent' | 'unknown';
+export const projectionClaimBatchSize = 64;
 type State = 'pending' | 'confirmed' | 'rejected' | 'uncertain';
 export class ProjectionOutbox {
   constructor(private readonly pool: Pick<Pool,'connect'>, readonly destinationId: string,
@@ -49,6 +50,36 @@ export class ProjectionOutbox {
       return { id: row.delivery_id,owner,token: row.generation,message };
     });
   }
+  /** One durable claim transaction, one batch at a time, with the existing lease/fence. */
+  async claimBatch(owner: string, limit = projectionClaimBatchSize): Promise<DeliveryClaim[]> {
+    assertUuid(owner);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > projectionClaimBatchSize) throw new PersistenceError('VALIDATION_FAILED');
+    return transaction(this.pool, async client => {
+      const ledger = await client.query<{ version: number }>('SELECT version FROM olos_export.projection_schema_versions ORDER BY version');
+      if (ledger.rows.length !== 1 || ledger.rows[0]?.version !== 1) throw new PersistenceError('SCHEMA_NOT_READY');
+      const picked = await client.query<DeliveryMessage & { generation: string }>(`WITH candidates AS MATERIALIZED (
+        SELECT delivery_id,batch_id,created_at FROM olos_export.projection_outbox
+        WHERE destination_id=$1 AND state='pending' AND available_at<=clock_timestamp()
+          AND (lease_until IS NULL OR lease_until<=clock_timestamp())
+        ORDER BY created_at,delivery_id FOR UPDATE SKIP LOCKED LIMIT $4
+      ), claimed AS (
+        UPDATE olos_export.projection_outbox o SET generation=generation+1,lease_owner=$2,
+          lease_until=clock_timestamp()+($3::double precision*interval '1 millisecond'),attempts=attempts+1
+        FROM candidates c WHERE o.delivery_id=c.delivery_id
+          AND c.batch_id=(SELECT batch_id FROM candidates ORDER BY created_at,delivery_id LIMIT 1)
+        RETURNING o.*
+      ) SELECT o.delivery_id,o.batch_id,o.destination_id,o.source_key,o.payload,o.request_payload,o.request_digest,o.generation,
+        b.source_table,b.source_namespace,b.source_contract_version,b.field_definitions,b.destination_version,b.mapping_version
+        FROM claimed o JOIN olos_export.projection_batches b USING(batch_id,destination_id)
+        ORDER BY o.created_at,o.delivery_id`, [this.destinationId,owner,this.leaseMs,limit]);
+      if (!picked.rows.length) return [];
+      await client.query(`INSERT INTO olos_export.projection_events(id,delivery_id,generation,attempt_id,event)
+        SELECT x.id,x.delivery_id,x.generation,NULL,'claimed'
+        FROM jsonb_to_recordset($1::jsonb) AS x(id uuid,delivery_id uuid,generation bigint)`,
+        [JSON.stringify(picked.rows.map(row => ({id:randomUUID(),delivery_id:row.delivery_id,generation:row.generation})))]);
+      return picked.rows.map(({generation,...message}) => ({id:message.delivery_id,owner,token:generation,message}));
+    });
+  }
   async defer(claim: DeliveryClaim, rejected = false, destinationBlocked = false): Promise<void> {
     this.identity(claim);
     await transaction(this.pool, async client => {
@@ -74,6 +105,51 @@ export class ProjectionOutbox {
       if (result.rowCount!==1) throw new PersistenceError('LEASE_LOST');
       await this.event(client,claim.id,claim.token,attemptId,'dispatch_authorized');
       return { attemptId,requestDigest,row: snapshot };
+    });
+  }
+  async authorizeBatch(items: readonly {claim: DeliveryClaim; row: Readonly<Candidate>}[]) {
+    this.batchIdentities(items.map(x=>x.claim));
+    const values=items.map(({claim,row})=>{
+      const snapshot=exactFlat(row);
+      return {id:claim.id,owner:claim.owner,token:claim.token,attemptId:randomUUID(),row:snapshot,
+        requestDigest:computeRequestDigest(snapshot,claim.message.destination_id,claim.message.destination_version,claim.message.mapping_version)};
+    });
+    return transaction(this.pool,async client=>{
+      const updated=await client.query(`UPDATE olos_export.projection_outbox o SET state='uncertain',attempt_id=x.attempt_id,
+        request_payload=x.payload,request_digest=x.digest,last_code='TARGET_UNKNOWN'
+        FROM jsonb_to_recordset($1::jsonb) AS x(id uuid,owner uuid,token bigint,attempt_id uuid,payload jsonb,digest text)
+        WHERE o.delivery_id=x.id AND o.destination_id=$2 AND o.lease_owner=x.owner AND o.generation=x.token
+          AND o.state='pending' AND o.lease_until>clock_timestamp() AND (o.request_digest IS NULL OR o.request_digest=x.digest)`,
+        [JSON.stringify(values.map(v=>({id:v.id,owner:v.owner,token:v.token,attempt_id:v.attemptId,payload:v.row,digest:v.requestDigest}))),this.destinationId]);
+      if(updated.rowCount!==values.length)throw new PersistenceError('LEASE_LOST');
+      await this.batchEvents(client,values.map(v=>({id:v.id,token:v.token,attemptId:v.attemptId,event:'dispatch_authorized'})));
+      return values;
+    });
+  }
+  private batchIdentities(claims: readonly DeliveryClaim[]) {
+    if(!claims.length || claims.length>projectionClaimBatchSize || new Set(claims.map(c=>c.id)).size!==claims.length)throw new PersistenceError('VALIDATION_FAILED');
+    for(const c of claims){this.identity(c);if(c.message.destination_id!==this.destinationId)throw new PersistenceError('VALIDATION_FAILED');}
+  }
+  private async batchEvents(client:PoolClient,values:readonly {id:string;token:string;attemptId:string;event:string}[]){
+    await client.query(`INSERT INTO olos_export.projection_events(id,delivery_id,generation,attempt_id,event)
+      SELECT x.id,x.delivery_id,x.generation,x.attempt_id,x.event FROM jsonb_to_recordset($1::jsonb)
+      AS x(id uuid,delivery_id uuid,generation bigint,attempt_id uuid,event text)`,
+      [JSON.stringify(values.map(v=>({id:randomUUID(),delivery_id:v.id,generation:v.token,attempt_id:v.attemptId,event:v.event})))]);
+  }
+  async settleBatch(items:readonly {claim:DeliveryClaim;attemptId:string;state:State}[]):Promise<void>{
+    this.batchIdentities(items.map(x=>x.claim));
+    for(const x of items){assertUuid(x.attemptId);if(!['pending','confirmed','rejected','uncertain'].includes(x.state))throw new PersistenceError('VALIDATION_FAILED');}
+    await transaction(this.pool,async client=>{
+      const updated=await client.query(`UPDATE olos_export.projection_outbox o SET state=x.state,lease_owner=NULL,lease_until=NULL,
+        confirmed_at=CASE WHEN x.state='confirmed' THEN clock_timestamp() ELSE o.confirmed_at END,
+        available_at=clock_timestamp()+($2::double precision*interval '1 millisecond'),last_code=x.code
+        FROM jsonb_to_recordset($1::jsonb) AS x(id uuid,owner uuid,token bigint,attempt_id uuid,state text,code text)
+        WHERE o.delivery_id=x.id AND o.destination_id=$3 AND o.lease_owner=x.owner AND o.generation=x.token
+          AND o.attempt_id=x.attempt_id AND o.state='uncertain' AND o.lease_until>clock_timestamp()`,
+        [JSON.stringify(items.map(({claim:c,attemptId,state})=>({id:c.id,owner:c.owner,token:c.token,attempt_id:attemptId,state,
+          code:state==='confirmed'?'CONFIRMED':state==='pending'?'TARGET_NOT_COMMITTED':state==='rejected'?'PROJECTION_REJECTED':'TARGET_UNKNOWN'}))),this.retryMs,this.destinationId]);
+      if(updated.rowCount!==items.length)throw new PersistenceError('LEASE_LOST');
+      await this.batchEvents(client,items.map(x=>({id:x.claim.id,token:x.claim.token,attemptId:x.attemptId,event:x.state})));
     });
   }
   async settle(claim: DeliveryClaim, attemptId: string, state: State): Promise<void> {

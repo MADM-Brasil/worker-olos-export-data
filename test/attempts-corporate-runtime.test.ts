@@ -110,7 +110,7 @@ it('a duplicate layout reference and repeated fixed policies are unnecessary; co
 it('a failed local preflight cannot create a remote intent, source or spool',async()=>{
  const save=vi.fn(),state:CorporateCycleState={next:'current',pending:null},b=createCorporateAttemptsBinding(config(),pin(),cats,state,save,async()=>{});
  const preflight=vi.spyOn(PostgresLargeBatchPersistence.prototype,'preflight').mockRejectedValue(Error('SOURCE_CONTRACT_NOT_APPROVED'));
- const run=vi.spyOn(ProjectionDispatcher.prototype,'runOnce').mockResolvedValue('empty');
+ const run=vi.spyOn(ProjectionDispatcher.prototype,'runBatch').mockResolvedValue(0);
  const pool={query:vi.fn(async(sql:string)=>({rows:sql.includes('count(*)')?[{n:0}]:[],rowCount:0}))} as unknown as Pool;
  const spool={active:vi.fn(async()=>null),create:vi.fn()} as unknown as SpoolRepository;
  try{await expect(createAttemptsPipeline(pool,pool,pool,spool,spoolLimits(),b).cycle(new AbortController().signal)).rejects.toThrow('SOURCE_CONTRACT_NOT_APPROVED');
