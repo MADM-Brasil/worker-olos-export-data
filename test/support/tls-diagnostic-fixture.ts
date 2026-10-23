@@ -25,7 +25,23 @@ export async function syntheticCertificates() {
     await exec('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-sha256','-days','2','-subj','/CN=synthetic-fallback',
       '-addext','basicConstraints=critical,CA:FALSE','-addext','extendedKeyUsage=serverAuth',
       '-keyout',join(directory,'self.key'),'-out',join(directory,'self.crt')]);
+    // A self-signed server leaf is not a certificate-signing CA. This keyUsage
+    // distinguishes it from the older fixture, which had no keyUsage restriction.
+    await exec('openssl',['req','-new','-key',join(directory,'self.key'),'-subj','/CN=SSL_Self_Signed_Fallback',
+      '-out',join(directory,'leaf.csr')]);
+    await writeFile(join(directory,'leaf.cnf'),'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n');
+    for(const [file,days] of [['leaf.crt','2'],['expired-leaf.crt','-1']]){
+      await exec('openssl',['x509','-req','-in',join(directory,'leaf.csr'),'-signkey',join(directory,'self.key'),
+        '-out',join(directory,file!),'-days',days!,'-sha256','-extfile',join(directory,'leaf.cnf')]);
+    }
+    // A cryptographically self-signed leaf with a nonmatching issuer lookup hint:
+    // the approval verifies the signature, but ordinary chain building fails.
+    await writeFile(join(directory,'direct-leaf.cnf'),'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\n2.5.29.35=DER:30:16:80:14:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n');
+    await exec('openssl',['x509','-req','-in',join(directory,'leaf.csr'),'-signkey',join(directory,'self.key'),
+      '-out',join(directory,'direct-leaf.crt'),'-days','2','-sha256','-extfile',join(directory,'direct-leaf.cnf')]);
     return { selfSigned: await readFile(join(directory,'self.crt'),'utf8'), selfKey: await readFile(join(directory,'self.key'),'utf8'),
+      serverLeaf:await readFile(join(directory,'leaf.crt'),'utf8'),expiredServerLeaf:await readFile(join(directory,'expired-leaf.crt'),'utf8'),
+      directTrustLeaf:await readFile(join(directory,'direct-leaf.crt'),'utf8'),
       ca: await readFile(join(directory,'ca.crt'),'utf8'), caKey: await readFile(join(directory,'ca.key'),'utf8'), cert: await readFile(join(directory,'server.crt'),'utf8'),
       expired: await readFile(join(directory,'expired.crt'),'utf8'), key: await readFile(join(directory,'server.key'),'utf8'),
       stop: () => rm(directory,{ recursive: true, force: true }) };

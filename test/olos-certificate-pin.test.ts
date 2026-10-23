@@ -21,8 +21,8 @@ function input(overrides: Record<string,unknown> = {}) {
     expiresAt: new Date(Date.now()+3600000).toISOString(),certificatePem: certificates.selfSigned,
     fingerprintSha256: new X509Certificate(certificates.selfSigned).fingerprint256,...overrides };
 }
-async function handshake(approval: OlosPinApproval, useDifferentLeaf = false, minVersion = 'TLSv1.2') {
-  const peer = await syntheticTdsTls({ cert: useDifferentLeaf ? certificates.cert : certificates.selfSigned,
+async function handshake(approval: OlosPinApproval, useDifferentLeaf = false, minVersion = 'TLSv1.2',serverLeaf=certificates.selfSigned) {
+  const peer = await syntheticTdsTls({ cert: useDifferentLeaf ? certificates.cert : serverLeaf,
     key: useDifferentLeaf ? certificates.key : certificates.selfKey });
   const socket = new Socket();
   const io = new PinnedMessageIO(socket,4096,new Debug(),approval);
@@ -55,6 +55,42 @@ it('pin aprovado autentica TLS 1.2 com certificado autoassinado sem SAN; zero LO
   expect(new X509Certificate(certificates.selfSigned).subjectAltName).toBeUndefined();
   expect(new X509Certificate(certificates.selfSigned).ca).toBe(false);
   await handshake(parseOlosPinApproval(input()));
+});
+it('autentica folha autoassinada CA:FALSE com keyUsage TLS sem keyCertSign',async()=>{
+  const cert=new X509Certificate(certificates.serverLeaf);
+  expect(cert.ca).toBe(false);expect(cert.subjectAltName).toBeUndefined();expect(cert.verify(cert.publicKey)).toBe(true);
+  const approval=parseOlosPinApproval(input({certificatePem:certificates.serverLeaf,fingerprintSha256:cert.fingerprint256}));
+  await handshake(approval,false,'TLSv1.2',certificates.serverLeaf);
+});
+it('autentica a folha exata aprovada mesmo quando o AKI impede construir sua cadeia',async()=>{
+  const cert=new X509Certificate(certificates.directTrustLeaf);
+  expect(cert.ca).toBe(false);expect(cert.subject).toBe(cert.issuer);expect(cert.verify(cert.publicKey)).toBe(true);
+  await handshake(parseOlosPinApproval(input({certificatePem:certificates.directTrustLeaf,fingerprintSha256:cert.fingerprint256})),false,'TLSv1.2',certificates.directTrustLeaf);
+});
+it('recusa outra folha autoassinada mesmo com a mesma chave pública aprovada',async()=>{
+  const approved=new X509Certificate(certificates.serverLeaf),presented=new X509Certificate(certificates.directTrustLeaf);
+  expect(approved.publicKey.equals(presented.publicKey)).toBe(true);expect(approved.fingerprint256).not.toBe(presented.fingerprint256);
+  await expect(handshake(parseOlosPinApproval(input({certificatePem:certificates.serverLeaf,fingerprintSha256:approved.fingerprint256})),false,'TLSv1.2',certificates.directTrustLeaf)).rejects.toThrow();
+});
+it('recusa certificado sem aprovação validada antes de criar o transporte TLS',async()=>{
+  await expect(handshake(input({certificatePem:certificates.serverLeaf,fingerprintSha256:new X509Certificate(certificates.serverLeaf).fingerprint256}) as OlosPinApproval,false,'TLSv1.2',certificates.serverLeaf)).rejects.toMatchObject({code:'PIN_APPROVAL_REQUIRED'});
+});
+it('recusa folha autoassinada expirada mesmo com fingerprint correspondente',()=>{
+  const cert=new X509Certificate(certificates.expiredServerLeaf);
+  expect(cert.verify(cert.publicKey)).toBe(true);
+  expect(()=>parseOlosPinApproval(input({certificatePem:certificates.expiredServerLeaf,fingerprintSha256:cert.fingerprint256}))).toThrow('CERT_HAS_EXPIRED');
+});
+it('revalida a validade do certificado ao iniciar TLS, mesmo com aprovação ainda vigente',async()=>{
+  const cert=new X509Certificate(certificates.serverLeaf),end=Date.parse(cert.validTo);
+  const approval=parseOlosPinApproval(input({certificatePem:certificates.serverLeaf,fingerprintSha256:cert.fingerprint256,expiresAt:new Date(end+86400000).toISOString()}));
+  const clock=vi.spyOn(Date,'now').mockReturnValue(end+1);
+  try{await expect(handshake(approval,false,'TLSv1.2',certificates.serverLeaf)).rejects.toMatchObject({code:'CERT_HAS_EXPIRED'});}
+  finally{clock.mockRestore();}
+});
+it('recusa autoassinatura inválida mesmo quando o fingerprint aprova os bytes adulterados',()=>{
+  const raw=Buffer.from(new X509Certificate(certificates.serverLeaf).raw);raw[raw.length-1]=raw[raw.length-1]!^1;
+  const cert=new X509Certificate(raw);expect(cert.verify(cert.publicKey)).toBe(false);
+  expect(()=>parseOlosPinApproval(input({certificatePem:cert.toString(),fingerprintSha256:cert.fingerprint256}))).toThrow('PIN_APPROVAL_INVALID');
 });
 it('outra folha na mesma cadeia é recusada pelo pin, apesar de cadeia confiável',async () => {
   await expect(handshake(parseOlosPinApproval(input({ certificatePem: certificates.ca,fingerprintSha256: new X509Certificate(certificates.ca).fingerprint256 })),true)).rejects.toMatchObject({ code: 'PIN_MISMATCH' });

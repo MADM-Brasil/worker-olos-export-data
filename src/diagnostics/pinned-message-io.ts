@@ -56,6 +56,11 @@ export class PinnedMessageIO extends MessageIO {
     const tls = connect({ socket: pair.socket1, host: this.approval.host,
       minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2', rejectUnauthorized: true,
       ca: this.approval.certificatePem,
+      // Trust may terminate at this exact independently approved certificate,
+      // even when OpenSSL cannot build it as a CA chain. Approval parsing already
+      // verifies its self-signature and validity; both peer checks still require
+      // the full DER SHA-256 pin. No system roots or peer-supplied anchors are added.
+      allowPartialTrustChain: true,
       checkServerIdentity: (_name, peer) => verifyPinnedPeer(this.approval,peer) });
     this.securePair = { cleartext: tls, encrypted: pair.socket2 };
     const incoming = (this as unknown as { incomingMessageStream: Transform }).incomingMessageStream;
