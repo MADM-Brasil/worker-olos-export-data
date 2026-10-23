@@ -91,6 +91,7 @@ it('ACTIVE promotion requires both real local deliveries and restart replays a c
  const pending=await prepared('service-active-current/v1');pending.intent.contractReviewDigest=digest(current.review);
  await writeFile(join(root,`attempt-${pending.intent.attemptId}.json`),JSON.stringify(pending.intent),{mode:0o600});
  const base=join(root,'isolated-control');await mkdir(base,{mode:0o700});await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:pending.intent.attemptId,workDir:root,configurationDigest:pending.loaded.configurationDigest}),{mode:0o600});
+ await writeFile(join(base,'log-inspection-active.json'),JSON.stringify({attemptId:'193c7869-6ba0-480f-a7c8-3fcd6e178394',workDir:join(base,'log-inspections','193c7869-6ba0-480f-a7c8-3fcd6e178394')}),{mode:0o600});
  const result=await serviceCycle({base,root,configFile:join(root,'config.json'),intervalMs:120000},pools,new AbortController().signal);
  expect(result.received).toBe(1);expect(result.acquisitionPerformed).toBe(false);
  expect(JSON.parse(await readFile(join(root,'cases',pending.intent.attemptId,'remote-pending.completed.json'),'utf8')).attemptId).toBe(pending.intent.attemptId);

@@ -101,19 +101,15 @@ pasta exclusiva bloqueia reuso. O marcador conservador é sincronizado antes do
 socket; se não houver result.json após encerramento, preservar tudo e tratar como
 incerto. Falhas de disco podem impedir o resumo/selo; nunca reparar fabricando-os.
 
-`log-inspection-active.json` e o pending de aquisição se excluem nos guards de
-permissão. A inspeção mantém seu marcador inclusive após sucesso para impedir uma
-nova chamada sem revisão; não remove nem confirma o pending de aquisição. Se já
-existir pending de aquisição, a inspeção também é bloqueada nesta versão. Isso
-não oferece inspeção de recuperação de aquisições pendentes: tal reconciliação
-continua externa. A exclusão pressupõe processos usando esta versão, o mesmo
-estado privado e o mesmo usuário. Outros consumidores/versões não são cercados.
+`log-inspection-active.json` preserva o histórico e impede reuso da inspeção;
+não bloqueia permits nem aquisições futuras do V2. O serviço informa a pendência
+em `historicalInspection`, com `blocksAcquisition=false`. O caso indeterminado
+permanece `REMOTE_OUTCOME_UNKNOWN`; não é reconciliado por essa separação.
 
-Não apagar ou trocar IDs para contornar um caso. A liberação pós-revisão é manual,
-fora deste comando: exige evidência remota independente e decisão registrada do
-responsável. Preservar os arquivos existentes, inclusive o marcador de exclusão
-como arquivo arquivado exclusivo, antes de qualquer liberação autorizada. Nenhum
-fluxo automático de liberação ou nova aquisição foi implementado.
+Um pending de aquisição continua bloqueando novas leituras e a própria inspeção.
+A recuperação de aquisições consumptivas incertas continua externa. Não apagar,
+arquivar para liberar, trocar IDs ou fabricar evidências/clearance. Intenções,
+marcadores, bytes e decisões existentes devem permanecer intactos.
 
 ## Revisão sem exposição
 

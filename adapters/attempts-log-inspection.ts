@@ -43,7 +43,7 @@ export async function prepareLogInspection(base:string,config:LogInspectionConfi
   const intentPath=join(workDir,'intent.json'),pendingPath=join(workDir,'pending.json');
   await durableExclusive(intentPath,intent);
   await durableExclusive(pendingPath,{purpose:'log-inspection',attemptId,configurationDigest,workDir,intentDigest:digest(intent)});
-  // Shared exclusion only; investigation bytes never enter the acquisition spool. Keep claim after all outcomes for review.
+  // Historical inspection claim; never gates acquisition. Keep after all outcomes for review and inspection reuse protection.
   await durableExclusive(join(base,'log-inspection-active.json'),{attemptId,workDir,configurationDigest});
   await absent(join(base,'remote-pending.json'));
   const spool=await LocalSpool.open(join(workDir,'spool'),spoolLimits());

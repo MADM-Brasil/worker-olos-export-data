@@ -120,7 +120,10 @@ carregado novamente por captura. Não substituir a validação TLS por WireGuard
 O caso `193c7869-6ba0-480f-a7c8-3fcd6e178394` continua indeterminado. Nenhum comando
 muda seu result.json, seus marcadores ou seus bytes. Zero bytes e ausência de TLS
 confirmado não provam que o RPC não executou. A decisão existente
-`PRESERVE_PENDING_EXTERNAL_RECONCILIATION` não libera consumo.
+`PRESERVE_PENDING_EXTERNAL_RECONCILIATION` permanece inalterada. A inspeção é uma
+pendência histórica, sem veto global sobre novas aquisições V2. O diagnóstico
+`historicalInspection` informa `REMOTE_OUTCOME_UNKNOWN`, `reviewRequired=true` e
+`blocksAcquisition=false`. Isso não estabelece o resultado remoto nem reconcilia o caso.
 
 Para acrescentar uma decisão, fornecer um JSON privado:
 
@@ -144,7 +147,8 @@ npm run worker:attempts -- reconcile-inspection \
   --confirm RECORD_OPERATIONAL_RECONCILIATION
 ```
 
-`ADMINISTRATIVE_CLOSURE` também mantém `INDETERMINATE` e não libera consumo.
+`ADMINISTRATIVE_CLOSURE` também mantém `INDETERMINATE`. Esses registros não são
+condições de autorização para aquisições futuras. O formato histórico de
 `TECHNICAL_CLEARANCE` exige `remoteOutcome=REMOTELY_ESTABLISHED` e um
 `externalAuditFile` privado contendo:
 
@@ -164,18 +168,23 @@ O código não pode autenticar a conclusão do DBA apenas por ler esse JSON: a
 procedência e suficiência da auditoria precisam ser aprovadas pelo responsável.
 O procedimento salva novo registro em `inspection-reconciliations/<recordId>.json`,
 com digests das evidências e do caso, e somente na decisão técnica cria
-`log-inspection-clearance.json`. O guard revalida esse registro e os digests antes
-do RPC; o marcador original permanece. Mudança nos arquivos invalida a liberação.
+`log-inspection-clearance.json`. A validação desses digests serve apenas ao
+diagnóstico histórico; não participa dos permits, ativação ou ciclos de aquisição.
+O marcador original permanece. Mudança nos arquivos torna a pendência histórica
+novamente indeterminada.
 Não criar esse documento usando ausência de bytes como justificativa.
 
-Falta, para liberar o caso atual, auditoria remota conclusiva da janela/login/
+Para estabelecer o resultado remoto do caso histórico, falta auditoria conclusiva da janela/login/
 sessão do SQL Server, identificação do RPC e avaliação de efeitos/interferência
 com os consumidores incrementais. Se essa informação não existir, preservar a
-exclusão. Este código não consulta a origem para fabricar essa prova.
+pendência histórica. Isso não impede novas aquisições. Não gerar clearance para
+liberar o V2. Este código não consulta a origem para fabricar essa prova.
 
 ## Bootstrap, revisão e importação
 
-Após autorização e reconciliação legítimas, executar uma captura única:
+Após autorização, TLS válido e ausência de aquisição consumptiva incerta, executar
+uma captura única. A recuperação da própria aquisição deve estar aprovada; a
+reconciliação da inspeção histórica de LogReadData não é pré-requisito:
 
 ```bash
 npm run worker:attempts -- bootstrap \

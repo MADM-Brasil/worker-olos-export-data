@@ -182,18 +182,22 @@ it.each(['success','multiple','output-error','return-error','truncated'])('real 
  if(mode==='success' || mode==='multiple')expect(result).toMatchObject({received:1,responseValidated:true,datasetCount:mode==='multiple'?2:1});
  if(mode==='output-error' || mode==='return-error' || mode==='truncated')expect(result.state).toBe('REVIEW_REQUIRED');
 });
-it('inspection claim blocks acquisition permission before source connection',async()=>{
+it.each(['ReadDataCurrentDay','ReadDataPreviousDays'] as const)('historical inspection does not gate %s acquisition permits',async procedure=>{
  const {mkdir}=await import('node:fs/promises');const {durableExclusive}=await import('../adapters/disposition-integration.js');
  const dir=join(root,'first-run');await mkdir(dir,{mode:0o700});
  await durableExclusive(join(root,'log-inspection-active.json'),{attemptId:randomUUID()});
- const current=reportedSignature('ReadDataCurrentDay',{evidence:'synthetic',nullable:{TableName:false,Message:true,ErrorMessage:true}});
+ const current=reportedSignature(procedure,{evidence:'synthetic',nullable:{TableName:false,Message:true,ErrorMessage:true}});
  const ep=prepareCorporateAttemptsEndpoint(endpointConfig,pin,current,{TableName:'AttemptsRawData'}),attemptId=randomUUID(),configurationDigest='a'.repeat(64);
  await expect(authorizeCorporateAttemptsOnce(ep,()=>{},async()=>{
   const intentPath=join(dir,`attempt-${attemptId}.json`),pendingPath=join(root,'remote-pending.json');
-  await durableExclusive(intentPath,{attemptId,configurationDigest,procedure:'ReadDataCurrentDay',operator:'test',approvalReference:'test-ticket',pinApprovalId:pin.approvalId});
+  await durableExclusive(intentPath,{attemptId,configurationDigest,procedure,operator:'test',approvalReference:'test-ticket',pinApprovalId:pin.approvalId});
   await durableExclusive(pendingPath,{attemptId,configurationDigest,workDir:dir});return {intentPath,pendingPath};
- })).rejects.toThrow();
- expect(()=>assertCorporateAttemptsExecution(ep)).toThrow();
+ })).resolves.toBeUndefined();
+ assertCorporateAttemptsExecution(ep);
+ assertPreparedAttemptsCall(ep,prepareCall(current,{TableName:'AttemptsRawData'},300000));
+ claimAttemptsConnection(ep);claimAttemptsSocket(ep);claimAttemptsLogin(ep);
+ const request=new Request(`dbo.usp_ExportData_${procedure}`,()=>{});
+ prepareTdsRequest(request,current,{TableName:'AttemptsRawData'},300000);assertPreparedAttemptsRpc(request,ep);
 });
 it('storage reservation failure grants no execution permission and preserves prepared intent',async()=>{
  const {LocalSpool}=await import('../adapters/local-spool.js');

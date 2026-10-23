@@ -14,7 +14,7 @@ import {exampleProfile} from '../src/offline/model.js';
 import {APPROVED_COLUMNS} from '../src/offline/tds-writer.js';
 import {parseOlosPinApproval} from '../src/security/olos-certificate-pin.js';
 import {digest,canonical} from '../src/persistence/validation.js';
-import {blockingCorporateInspection} from '../src/olos/tds/attempts-access.js';
+import {hasUnresolvedCorporateInspection} from '../src/olos/tds/attempts-access.js';
 import {IsolatedTdsSource} from '../src/olos/tds/source.js';
 import {OlosError} from '../src/olos/types.js';
 import {parseCorporateArguments} from '../adapters/attempts-corporate.js';
@@ -113,21 +113,46 @@ it.each(['before-rpc','after-rpc','partial','tls','login','vpn'] as const)('capt
  await expect(capture()).rejects.toThrow('RECOVERY_REQUIRED');
  expect(await readFile(join(dir,'capture','batches',p!.attemptId,'response.partial'))).toEqual(mode==='partial'?response.subarray(0,33):Buffer.alloc(0));
 });
-it('inspection administrative decisions preserve the old case and cannot clear consumptive exclusion',async()=>{
+it('inspection administrative decisions preserve the historical unresolved outcome',async()=>{
  const id='193c7869-6ba0-480f-a7c8-3fcd6e178394',workDir=join(base,'log-inspections',id);await mkdir(workDir,{recursive:true,mode:0o700});
  const original={intent:{attemptId:id},pending:{attemptId:id},result:{state:'REMOTE_OUTCOME_UNKNOWN',bytes:0}};
  for(const [file,value] of Object.entries(original))await save(join(workDir,`${file}.json`),value);
  const marker={attemptId:id,workDir};await save(join(base,'log-inspection-active.json'),marker);
  for(const decision of ['PRESERVE_PENDING_EXTERNAL_RECONCILIATION','ADMINISTRATIVE_CLOSURE'] as const){
   const r=await reconcileServiceInspection(base,{version:'olos-inspection-reconciliation/v1',recordId:randomUUID(),caseId:id,operator:'responsible',reference:'external-review',issuedAt:new Date().toISOString(),decision,remoteOutcome:'INDETERMINATE'});
-  expect(r.consumptiveRelease).toBe(false);expect(blockingCorporateInspection(base)).toBe(true);
+  expect(r.consumptiveRelease).toBe(false);expect(hasUnresolvedCorporateInspection(base)).toBe(true);
  }
- const audit=join(base,'audit.json');await save(audit,{kind:'olos-remote-audit/v1',caseId:id,markerDigest:digest(marker),operator:'external-auditor',reference:'AUDIT-TEST',conclusion:'NO_UNRESOLVED_INTERFERENCE',rpcAuditEvidence:'external server audit',consumptionImpactEvidence:'external consumption evidence',issuedAt:new Date().toISOString()});
- await reconcileServiceInspection(base,{version:'olos-inspection-reconciliation/v1',recordId:randomUUID(),caseId:id,operator:'responsible',reference:'external-review',issuedAt:new Date().toISOString(),decision:'TECHNICAL_CLEARANCE',remoteOutcome:'REMOTELY_ESTABLISHED',externalAuditFile:audit});
- expect(blockingCorporateInspection(base)).toBe(false);
+ const options={base,root,configFile,intervalMs:120000};
+ expect(await operationalServiceStatus(options)).toMatchObject({state:'BOOTSTRAP',lastError:null,historicalInspection:{caseId:id,state:'REMOTE_OUTCOME_UNKNOWN',reviewRequired:true,blocksAcquisition:false}});
+ const intent=await capture();expect(intent.procedure).toBe('ReadDataCurrentDay');
+ expect(await readdir(base)).not.toContain('log-inspection-clearance.json');
+ for(const record of await readdir(join(base,'inspection-reconciliations'))){
+  expect(JSON.parse(await readFile(join(base,'inspection-reconciliations',record),'utf8')).decision).not.toBe('TECHNICAL_CLEARANCE');
+ }
  for(const [file,value] of Object.entries(original))expect(JSON.parse(await readFile(join(workDir,`${file}.json`),'utf8'))).toEqual(value);
  expect(JSON.parse(await readFile(join(base,'log-inspection-active.json'),'utf8'))).toEqual(marker);
- await save(join(workDir,'result.json'),{state:'tampered'});expect(blockingCorporateInspection(base)).toBe(true);
+ await save(join(workDir,'result.json'),{state:'tampered'});expect(hasUnresolvedCorporateInspection(base)).toBe(true);
+});
+it.each(['ReadDataCurrentDay','ReadDataPreviousDays'] as const)('uncertain %s remains blocking with a historical inspection present',async procedure=>{
+ const id='193c7869-6ba0-480f-a7c8-3fcd6e178394';
+ await save(join(base,'log-inspection-active.json'),{attemptId:id,workDir:join(base,'log-inspections',id)});
+ const factory=vi.fn(sourceFactory('partial'));
+ const acquire=()=>observeServiceCapture(base,root,loaded,approval(),guard(),procedure,new AbortController().signal,undefined,factory);
+ await expect(acquire()).rejects.toThrow('CONNECTION_FAILED');
+ const pending=await pendingServiceCase(base,root);expect(pending?.procedure).toBe(procedure);
+ const files=await readdir(root),pendingBytes=await readFile(join(base,'remote-pending.json'));
+ await expect(acquire()).rejects.toThrow('RECOVERY_REQUIRED');expect(factory).toHaveBeenCalledTimes(1);
+ expect(await readdir(root)).toEqual(files);expect(await readFile(join(base,'remote-pending.json'))).toEqual(pendingBytes);
+ expect(await operationalServiceStatus({base,root,configFile,intervalMs:120000})).toMatchObject({state:'RECOVERY_REQUIRED',pendingBatch:pending!.attemptId,historicalInspection:{state:'REMOTE_OUTCOME_UNKNOWN',blocksAcquisition:false}});
+});
+it('unreadable historical evidence and retired cycle errors remain diagnostic only',async()=>{
+ await writeFile(join(base,'log-inspection-active.json'),'invalid JSON',{mode:0o600});
+ await mkdir(join(root,'cycles'),{mode:0o700});
+ const cycle=join(root,'cycles',`1-${randomUUID()}.json`),record={lastError:'INSPECTION_EXTERNAL_RECONCILIATION_REQUIRED'};
+ await save(cycle,record);
+ expect(await operationalServiceStatus({base,root,configFile,intervalMs:120000})).toMatchObject({state:'BOOTSTRAP',lastError:null,historicalInspection:{state:'REMOTE_OUTCOME_UNKNOWN',blocksAcquisition:false,diagnosticError:'HISTORICAL_INSPECTION_UNREADABLE'}});
+ await capture();expect(JSON.parse(await readFile(cycle,'utf8'))).toEqual(record);
+ expect(await readFile(join(base,'log-inspection-active.json'),'utf8')).toBe('invalid JSON');
 });
 it('certificate lifetime policy never outlives the actual certificate or approves an observed pin implicitly',async()=>{
  const input=JSON.parse(await readFile(loaded.config.pinApprovalFile,'utf8')),end=new X509Certificate(input.certificatePem).validTo;

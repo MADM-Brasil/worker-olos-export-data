@@ -14,7 +14,7 @@ import {agentMap,parseAgentCatalog} from '../src/offline/agents.js';
 import {catalog,recordsFromJson,parseLossless,type Catalogs} from '../src/offline/model.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 import {reportedSignature} from '../src/olos/procedure-signatures.js';
-import {blockingCorporateInspection,prepareCorporateAttemptsEndpoint,authorizeCorporateAttemptsOnce} from '../src/olos/tds/attempts-access.js';
+import {hasUnresolvedCorporateInspection,prepareCorporateAttemptsEndpoint,authorizeCorporateAttemptsOnce} from '../src/olos/tds/attempts-access.js';
 import {IsolatedTdsSource,replayTdsResponse} from '../src/olos/tds/source.js';
 import {parserLimits} from '../src/olos/tds/raw-parser.js';
 import {InspectionDiagnostics,inspectionErrorCode,reportInspectionFailure} from '../src/olos/tds/inspection-diagnostics.js';
@@ -166,7 +166,6 @@ export const recoveryApprovalSchema=z.object({scope:z.literal('OLOS_CONSUMPTIVE_
  ownershipEvidence:text,retentionCompletenessEvidence:text,recoveryExerciseEvidence:text,externalRunbookReference:text,
  failurePolicy:z.literal('STOP_PRESERVE_EXTERNAL_RECONCILIATION_NO_REMOTE_RETRY')}).strict();
 export async function promoteService(root:string,loaded:Loaded,approval:ServiceApproval,input:unknown){
- if(blockingCorporateInspection(dirname(root)))throw Error('INSPECTION_EXTERNAL_RECONCILIATION_REQUIRED');
  const reviews=await reviewsFor(root,loaded),activation=validateActivation(input,loaded.config,loaded.configurationDigest,approval,reviews);
  const recovery=recoveryApprovalSchema.parse(await privateJson(activation.recoveryEvidence));
  if(recovery.configurationDigest!==loaded.configurationDigest || recovery.captureIds.some((id,i)=>id!==reviews[i]!.captureId) || Date.parse(recovery.approvedAt)>Date.now())throw Error('RECOVERY_NOT_ESTABLISHED');
@@ -249,6 +248,20 @@ export async function reconcileServiceInspection(base:string,input:unknown){
  return {recordId:decision.recordId,decision:decision.decision,remoteOutcome:decision.remoteOutcome,consumptiveRelease:record.consumptiveRelease};
 }
 
+/** Historical evidence remains private and immutable; diagnostic failures cannot gate acquisition. */
+async function historicalInspectionStatus(base:string){
+ const path=join(base,'log-inspection-active.json');
+ try{
+  if(!await serviceExists(path))return null;
+  const marker=await privateJson(path) as {attemptId?:unknown};
+  const caseId=typeof marker?.attemptId==='string' && z.string().uuid().safeParse(marker.attemptId).success?marker.attemptId:null;
+  const reviewRequired=hasUnresolvedCorporateInspection(base);
+  return {caseId,procedure:'LogReadData',state:reviewRequired?'REMOTE_OUTCOME_UNKNOWN':'REMOTELY_ESTABLISHED',reviewRequired,blocksAcquisition:false};
+ }catch{
+  return {caseId:null,procedure:'LogReadData',state:'REMOTE_OUTCOME_UNKNOWN',reviewRequired:true,blocksAcquisition:false,diagnosticError:'HISTORICAL_INSPECTION_UNREADABLE'};
+ }
+}
+
 export interface ServiceOptions{base:string;root:string;configFile:string;intervalMs:number;}
 async function serviceAuthorization(options:ServiceOptions){
  const loaded=await loadServiceConfiguration(options.configFile);
@@ -270,10 +283,12 @@ export async function operationalServiceStatus(options:ServiceOptions){
   }catch{result.state='RECOVERY_REQUIRED';result.lastError='ACTIVATION_REVALIDATION_FAILED';}
  }
  if(await serviceExists(join(base,'remote-pending.json'))){result.state='RECOVERY_REQUIRED';const p=await privateJson(join(base,'remote-pending.json')) as {attemptId?:string};result.pendingBatch=p.attemptId??null;}
- if(blockingCorporateInspection(base)){result.state='RECOVERY_REQUIRED';result.lastError='INSPECTION_EXTERNAL_RECONCILIATION_REQUIRED';}
+ result.historicalInspection=await historicalInspectionStatus(base);
  if(await serviceExists(join(root,'cycles'))){const names=(await readdir(join(root,'cycles'))).filter(n=>/^\d+-[a-f0-9-]+\.json$/.test(n)).sort();
   if(names.length){const last=await privateJson(join(root,'cycles',names.at(-1)!)) as Record<string,unknown>;
-   for(const field of ['lastProcedure','lastCycleStartedAt','lastCycleCompletedAt','lastImportConfirmedAt','imported','duplicates','lastError'])result[field]=last[field]??null;}}
+   for(const field of ['lastProcedure','lastCycleStartedAt','lastCycleCompletedAt','lastImportConfirmedAt','imported','duplicates','lastError'])result[field]=last[field]??null;
+   // Old cycle files are immutable; the retired inspection error is no longer an operational failure.
+   if(result.lastError==='INSPECTION_EXTERNAL_RECONCILIATION_REQUIRED')result.lastError=null;}}
  if(result.state==='ACTIVE' && (result.tls as {valid:boolean}|null)?.valid===false)result.state='RECOVERY_REQUIRED';
  return result;
 }
@@ -293,7 +308,7 @@ async function withLocalLock<T>(options:ServiceOptions,operation:(pools:RuntimeP
  }finally{process.removeListener('SIGINT',cancel);process.removeListener('SIGTERM',cancel);if(lock){await lock.query('SELECT pg_advisory_unlock(740219,1)').catch(()=>{});lock.release(true);}await probe.stop();}
 }
 export async function serviceCycle(options:ServiceOptions,pools:RuntimePools,signal:AbortSignal){
- const {loaded,approval,guard}=await serviceAuthorization(options);guard();if(blockingCorporateInspection(options.base))throw Error('INSPECTION_EXTERNAL_RECONCILIATION_REQUIRED');const reviews=await assertActive(options,loaded,approval);
+ const {loaded,approval,guard}=await serviceAuthorization(options);guard();const reviews=await assertActive(options,loaded,approval);
  const activation=await privateJson(join(options.root,'activation.json')) as {recoveryEvidence:string;recoveryDigest:string};
  const activeGuard=()=>{guard();if(digest(privateServiceJsonSync(join(options.root,'activation.json')))!==digest(activation) || digest(privateServiceJsonSync(activation.recoveryEvidence))!==activation.recoveryDigest ||
   reviews.some(r=>digest(privateServiceJsonSync(join(options.root,'reviews',`${r.procedure}.json`)))!==digest(r)))throw Error('ACTIVATION_REQUIREMENTS_MISSING');};
@@ -350,11 +365,9 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
  },true);
  if(action==='activate'){
   if(await serviceExists(join(options.base,'remote-pending.json')))throw Error('RECOVERY_REQUIRED');
-  if(blockingCorporateInspection(options.base))throw Error('INSPECTION_EXTERNAL_RECONCILIATION_REQUIRED');
   await promoteService(options.root,loaded,approval,await privateJson(flags['--activation-file']!));return {state:'ACTIVE',schedulerStarted:false};
  }
  if(action==='start'){
-  if(blockingCorporateInspection(options.base))throw Error('INSPECTION_EXTERNAL_RECONCILIATION_REQUIRED');
   await assertActive(options,loaded,approval);
   const settings=await localSettings();if(canonical(settings.postgres)!==canonical(loaded.config.postgres))throw Error('POSTGRES_DESTINATION_CHANGED');
   const pools=createLocalRuntimePools(settings.passwords,()=>{},settings.postgres);
