@@ -1,4 +1,4 @@
-import {reportInspectionFailure,type InspectionDiagnosticObserver} from './inspection-diagnostics.js';
+import {inspectionTechnicalErrorCode,reportInspectionFailure,type InspectionDiagnosticObserver} from './inspection-diagnostics.js';
 import { canonical } from '../../persistence/validation.js';
 import { isLogInspectionEndpoint, isPreparedAttemptsEndpoint, assertPreparedAttemptsCall, assertCorporateAttemptsExecution, type PreparedAttemptsEndpoint } from './attempts-access.js';
 import { isDispositionEndpoint, assertDispositionCall, type DispositionEndpoint } from './disposition-access.js';
@@ -113,7 +113,7 @@ export class IsolatedTdsSource {
     let closed = false;
     const end = new Promise<void>(resolve => connection.once('end',() => { closed = true; resolve(); }));
     const notify = () => { wake?.(); wake = undefined; };
-    const fail = (code: OlosError['code']) => { reportInspectionFailure(this.inspectionDiagnostics,new OlosError(code));failure ??= new OlosError(code,dispatched ? 'unknown' : 'not_sent'); notify(); };
+    const fail = (code: OlosError['code'],error:unknown=new OlosError(code)) => { reportInspectionFailure(this.inspectionDiagnostics,error);failure ??= new OlosError(code,dispatched ? 'unknown' : 'not_sent',inspectionTechnicalErrorCode(error)); notify(); };
     const cancel = () => { fail(timedOut ? 'TIMEOUT' : 'ABORTED'); if (dispatched) connection.cancel(); else connection.close(); };
     connection.on('secure',tls => {
       const exceptional = isExceptionalDispositionEndpoint(e), protocol = tls.getProtocol();
@@ -122,7 +122,7 @@ export class IsolatedTdsSource {
     });
     request = new Request(procedures[snapshot.procedure],error => {
       if(error)reportInspectionFailure(this.inspectionDiagnostics,error,timedOut?'TIMEOUT':signal.aborted?'ABORTED':'EXECUTION_FAILED');
-      if (error) fail(timedOut ? 'TIMEOUT' : signal.aborted ? 'ABORTED' : 'EXECUTION_FAILED');
+      if (error) fail(timedOut ? 'TIMEOUT' : signal.aborted ? 'ABORTED' : 'EXECUTION_FAILED',error);
       finished = true; notify();
     });
     // Assinaturas atuais são conferidas antes da conexão, inclusive bloqueios Reset/DataAvailable.
@@ -134,7 +134,7 @@ export class IsolatedTdsSource {
       if(this.observedDatasets.length>=64)throw new OlosError('LIMIT_EXCEEDED','unknown');
       const metadata=columns.map(c=>({name:c.colName,type:c.type.name,nullable:Boolean(c.flags&1),dataLength:c.dataLength??null,collationHex:c.collation?.toBuffer().toString('hex')??null}));
       this.observedDatasets.push(metadata);this.observedMetadata.push(...metadata);this.responseObservation.datasetCount=this.observedDatasets.length;
-    },fields: this.fields.length ? this.fields : undefined, limits: this.limits, fail: () => fail('INVALID_RESPONSE'), token: token => {
+    },fields: this.fields.length ? this.fields : undefined, limits: this.limits, fail: error => fail('INVALID_RESPONSE',error), token: token => {
       if (finalDone) throw new OlosError('INVALID_RESPONSE','unknown');
       if (token.name === 'RETURNSTATUS') {lastStatus = token.value as number;this.responseObservation.returnValue=lastStatus;}
       if (['DONE','DONEPROC','DONEINPROC'].includes(token.name)) {
@@ -165,13 +165,13 @@ export class IsolatedTdsSource {
       Object.defineProperty(output,name,{ value, enumerable: true });
     });
     connection.on('infoMessage',() => { this.metrics.infoMessages++; }); // não guardar conteúdo pessoal/mensagens em logs
-    connection.on('error',error => { reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');fail('CONNECTION_FAILED'); finished = true; notify(); });
+    connection.on('error',error => { reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');fail('CONNECTION_FAILED',error); finished = true; notify(); });
     connection.once('end',() => { if (!finished) fail('EXECUTION_FAILED'); finished = true; notify(); });
     this.busy = true;
     signal.addEventListener('abort',cancel,{ once: true });
     const timer = setTimeout(() => { timedOut = true; cancel(); },timeoutMs);
     try {
-      await new Promise<void>((resolve,reject) => { connection.connect(error => {if(error){reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');reject(new OlosError('CONNECTION_FAILED'));}else{this.inspectionDiagnostics?.({kind:'stage',stage:'SQL_LOGIN_ACCEPTED'});resolve();}}); });
+      await new Promise<void>((resolve,reject) => { connection.connect(error => {if(error){reportInspectionFailure(this.inspectionDiagnostics,error,'CONNECTION_FAILED');reject(new OlosError('CONNECTION_FAILED','not_sent',inspectionTechnicalErrorCode(error,'CONNECTION_FAILED')));}else{this.inspectionDiagnostics?.({kind:'stage',stage:'SQL_LOGIN_ACCEPTED'});resolve();}}); });
       if ((isExceptionalDispositionEndpoint(e) || isPreparedAttemptsEndpoint(e)) && this.transportSecurity.length !== 1) throw new OlosError('CONNECTION_FAILED');
       if (failure || signal.aborted) throw failure ?? new OlosError('ABORTED');
       this.metrics.rows = 0; this.observedMetadata.length = 0; this.observedFields.length = 0; this.metrics.calls++; dispatched = true;
@@ -195,7 +195,7 @@ export class IsolatedTdsSource {
     } catch (error) {
       reportInspectionFailure(this.inspectionDiagnostics,error);
       if (error instanceof OlosError) throw error;
-      throw new OlosError('EXECUTION_FAILED',dispatched ? 'unknown' : 'not_sent');
+      throw new OlosError('EXECUTION_FAILED',dispatched ? 'unknown' : 'not_sent',inspectionTechnicalErrorCode(error));
     } finally {
       clearTimeout(timer); signal.removeEventListener('abort',cancel);
       // Nunca devolver conexão ao pool ou liberar exclusão enquanto houver execução sem término.

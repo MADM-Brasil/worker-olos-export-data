@@ -13,7 +13,7 @@ import type {ColumnMetadata} from 'tedious/lib/token/colmetadata-token-parser.js
 import type { TokenHandler } from 'tedious/lib/token/handler.js';
 import type { Parser } from 'tedious/lib/token/token-stream-parser.js';
 import { ExactTokenParser, type TdsField, type RawParserLimits } from './raw-parser.js';
-import {reportInspectionFailure,type InspectionDiagnosticObserver} from './inspection-diagnostics.js';
+import {reportTransportDiagnostic,reportInspectionFailure,type InspectionDiagnosticObserver} from './inspection-diagnostics.js';
 import { OlosError } from '../types.js';
 
 const version = createRequire(import.meta.url)('tedious/package.json').version as string;
@@ -71,6 +71,7 @@ export class ExactConnection extends Connection {
     io.inspectionDiagnostics=this.inspectionDiagnostics;this.messageIo=io;
     this.messageIo.on('secure',tls => this.emit('secure',tls));
     this.socket = socket; this.closed = false;
+    this.inspectionDiagnostics?.({kind:'stage',stage:'PRELOGIN_SENT'});
     this.sendPreLogin(); this.transitionTo(this.STATE.SENT_PRELOGIN);
   }
   override sendLogin7Packet(): void {
@@ -105,7 +106,7 @@ export class ExactConnection extends Connection {
     }catch(error){reportInspectionFailure(this.inspectionDiagnostics,error);throw error;}
   }
 
-  acquisition: { metadataObserved?: (columns:readonly ColumnMetadata[])=>void; fields: readonly TdsField[] | undefined; limits: RawParserLimits; token: (value: { name: string; [key: string]: unknown }) => void; fail: () => void } | undefined;
+  acquisition: { metadataObserved?: (columns:readonly ColumnMetadata[])=>void; fields: readonly TdsField[] | undefined; limits: RawParserLimits; token: (value: { name: string; [key: string]: unknown }) => void; fail: (error?:unknown) => void } | undefined;
   /** Request response only: LOGIN7, passwords and authentication messages never enter this sink. */
   responseCapture: ((chunk: Buffer) => Promise<void>) | undefined;
   private responseReplayed=false;
@@ -134,9 +135,9 @@ export class ExactConnection extends Connection {
         // Mantém state machine, erros, OUTPUT, doneProc e row do driver; sem debug de valores.
         const dispatch = handler[token.handlerName as keyof TokenHandler] as (t: unknown) => void;
         dispatch.call(handler,token);
-      } catch { acquisition.fail(); parser.destroy(); this.close(); }
+      } catch(error) { reportTransportDiagnostic(this.inspectionDiagnostics,'TOKEN_PARSER_FAILED',error);acquisition.fail(error); parser.destroy(); this.close(); }
     });
-    parser.on('error',() => { acquisition.fail(); this.close(); });
+    parser.on('error',error => { reportTransportDiagnostic(this.inspectionDiagnostics,'TOKEN_PARSER_FAILED',error);acquisition.fail(error); this.close(); });
     parser.on('end',() => emitter.emit('end'));
     return Object.assign(emitter,{ parser, debug: this.debug, options: this.config.options,
       pause: () => parser.pause(), resume: () => parser.resume() }) as Parser;

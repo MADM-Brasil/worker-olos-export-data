@@ -35,7 +35,7 @@ export async function syntheticCertificates() {
 /** Synthetic PRELOGIN/TLS peer, not a SQL Server. Records every decrypted client byte. */
 export async function syntheticTdsTls(options: { cert: string; key: string; minVersion?: SecureVersion;
   response?: Buffer; packetType?: number; silent?: boolean; disconnect?: boolean; flood?: boolean; fragmented?: boolean;
-  stallTls?: boolean; disconnectTls?: boolean }) {
+  stallTls?: boolean; disconnectTls?: boolean; handshakePacketType?: number; multiPacket?: boolean; handshakeResponse?: Buffer; invalidHandshakeHeader?: boolean }) {
   const sockets = new Set<Socket>();
   const sessions: { types: number[]; applicationBytes: number; secure: boolean }[] = [];
   const server = createServer(socket => {
@@ -45,6 +45,12 @@ export async function syntheticTdsTls(options: { cert: string; key: string; minV
     let buffer = Buffer.alloc(0), first = true, raw = false;
     let pair: InstanceType<typeof Pair> | undefined, tls: TLSSocket | undefined;
     const packet = (body: Buffer, type: number) => {
+      if(options.multiPacket && body.length>1){
+        const middle=Math.floor(body.length/2);
+        const parts=[body.subarray(0,middle),body.subarray(middle)];
+        const packets=parts.map((part,i)=>{const h=Buffer.alloc(8);h[0]=type;h[1]=i===1?1:0;h.writeUInt16BE(part.length+8,2);h[6]=i+1;return Buffer.concat([h,part]);});
+        for(const bytes of packets){socket.write(bytes.subarray(0,3));socket.write(bytes.subarray(3));}return;
+      }
       const header = Buffer.alloc(8); header[0] = type; header[1] = 1; header.writeUInt16BE(body.length+8,2); header[6] = 1;
       const data = Buffer.concat([header,body]);
       if (options.fragmented) { socket.write(data.subarray(0,3)); setImmediate(() => socket.write(data.subarray(3))); }
@@ -82,7 +88,8 @@ export async function syntheticTdsTls(options: { cert: string; key: string; minV
           pair.socket2.on('error', () => {});
           pair.socket2.on('data', encrypted => {
             if (raw) socket.write(encrypted);
-            else packet(encrypted,4);
+            else if(options.invalidHandshakeHeader){const header=Buffer.alloc(8);header[0]=4;header.writeUInt16BE(7,2);socket.write(header);}
+            else packet(options.handshakeResponse??encrypted,options.handshakePacketType??4);
           });
         } else {
           if (options.disconnectTls) { socket.destroy(); return; }

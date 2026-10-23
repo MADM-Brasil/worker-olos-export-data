@@ -6,7 +6,7 @@ import { Request } from 'tedious';
 import { parseOlosPinApproval } from '../src/security/olos-certificate-pin.js';
 import { prepareCorporateAttemptsEndpoint, matchesPreparedAttemptsConnection, assertCorporateAttemptsExecution } from '../src/olos/tds/attempts-access.js';
 import { ExactConnection } from '../src/olos/tds/connection.js';
-import {InspectionDiagnostics} from '../src/olos/tds/inspection-diagnostics.js';
+import {InspectionDiagnostics,inspectionTechnicalErrorCode} from '../src/olos/tds/inspection-diagnostics.js';
 import { PinnedMessageIO } from '../src/diagnostics/pinned-message-io.js';
 import { IsolatedTdsSource } from '../src/olos/tds/source.js';
 import { reportedSignature, verifiedProcedureContracts } from '../src/olos/procedure-signatures.js';
@@ -121,4 +121,17 @@ it('porta de recuperação existente audita tentativa bloqueada; não classifica
   const request = { caseId: randomUUID(),sourceTable: 'AttemptsRawData' as const,readType: 'current_day' as const,exportDate: '2026-10-01',pkRange: null };
   await expect(port.inspectLogReadData(request,new AbortController().signal)).rejects.toMatchObject({ code: 'EXECUTION_FAILED',outcome: 'unknown' });
   expect(classify).not.toHaveBeenCalled(); expect(audit.recordRecoveryAttempt).toHaveBeenCalledWith(request.caseId,'inspect_log','failed',null);
+});
+
+it('malformed PRELOGIN is reported through the real Tedious connection callback, before TLS/login/RPC',async()=>{
+ const server=await syntheticTdsTls({cert:certs.selfSigned,key:certs.selfKey,response:Buffer.from([1,0,255,0,1,255,1])});
+ const c=new ExactConnection({server:'127.0.0.1',authentication:{type:'default',options:{userName:'synthetic',password:'synthetic'}},options:{port:server.port,database:'phase3d_fixture',serverName:'localhost',encrypt:true,trustServerCertificate:false,connectTimeout:1500,maxRetriesOnTransientErrors:0,cryptoCredentialsDetails:{ca:certs.selfSigned,minVersion:'TLSv1.2',maxVersion:'TLSv1.2'}}},undefined,pin());
+ const diagnostics=new InspectionDiagnostics();c.inspectionDiagnostics=diagnostics.observe;c.on('error',()=>{});
+ const login=vi.spyOn(c,'sendLogin7Packet'),rpc=vi.spyOn(c,'callProcedure');
+ try{
+  const error=await new Promise<Error|undefined>(resolve=>c.connect(resolve));
+  expect(inspectionTechnicalErrorCode(error)).toBe('ERR_OUT_OF_RANGE');
+  expect(diagnostics.snapshot()).toMatchObject({phase:'PRELOGIN',errorCode:'ERR_OUT_OF_RANGE',rpcDispatchState:'NOT_OBSERVED'});
+  expect(login).not.toHaveBeenCalled();expect(rpc).not.toHaveBeenCalled();expect(server.sessions).toHaveLength(1);expect(server.sessions[0]?.applicationBytes).toBe(0);
+ }finally{c.close();login.mockRestore();rpc.mockRestore();await server.stop();}
 });

@@ -1,3 +1,4 @@
+import type {InspectionErrorCode} from './tds/inspection-diagnostics.js';
 import type { Procedure } from './contracts.js';
 
 export type OlosFailure = 'REAL_EXECUTION_BLOCKED' | 'PROCEDURE_BLOCKED' | 'CONTRACT_UNCONFIRMED' | 'INVALID_PARAMETER' |
@@ -5,7 +6,7 @@ export type OlosFailure = 'REAL_EXECUTION_BLOCKED' | 'PROCEDURE_BLOCKED' | 'CONT
   'PRECISION_UNSAFE' | 'LIMIT_EXCEEDED' | 'BUSY' | 'ABORTED' | 'REPETITION_UNCONFIRMED' | 'NO_PROGRESS';
 // Não contém mensagem do SQL Server, parâmetros, payload, stack original ou cause.
 export class OlosError extends Error {
-  constructor(readonly code: OlosFailure, readonly outcome: 'not_sent' | 'unknown' = 'not_sent') {
+  constructor(readonly code: OlosFailure, readonly outcome: 'not_sent' | 'unknown' = 'not_sent', readonly technicalCode?:InspectionErrorCode) {
     super(code); this.name = 'OlosError';
   }
 }

@@ -15,6 +15,7 @@ import {APPROVED_COLUMNS} from '../src/offline/tds-writer.js';
 import {parseOlosPinApproval} from '../src/security/olos-certificate-pin.js';
 import {digest,canonical} from '../src/persistence/validation.js';
 import {hasUnresolvedCorporateInspection} from '../src/olos/tds/attempts-access.js';
+import {ExactConnection} from '../src/olos/tds/connection.js';
 import {IsolatedTdsSource} from '../src/olos/tds/source.js';
 import {OlosError} from '../src/olos/types.js';
 import {parseCorporateArguments} from '../adapters/attempts-corporate.js';
@@ -202,4 +203,23 @@ it('120 seconds are counted from completion, even when a successful cycle takes 
   await vi.advanceTimersByTimeAsync(119999);expect(calls).toBe(1);await vi.advanceTimersByTimeAsync(1);expect(calls).toBe(2);
   release();await vi.advanceTimersByTimeAsync(0);await runner.stop();
  }finally{vi.useRealTimers();}
+});
+
+it.each(['ReadDataCurrentDay','ReadDataPreviousDays'] as const)('%s retains the technical TLS code and digest-backed not-dispatched evidence',async procedure=>{
+ const connect=vi.spyOn(ExactConnection.prototype,'connect').mockImplementation(function(this:ExactConnection,listener){
+  this.inspectionDiagnostics?.({kind:'stage',stage:'TLS_HANDSHAKE_STARTED'});
+  listener?.(Object.assign(Error('PRIVATE_CONNECTION_MESSAGE'),{code:'ESOCKET',cause:Object.assign(Error('PRIVATE_TLS_MESSAGE'),{code:'INVALID_TDS'})}));
+ });
+ vi.spyOn(ExactConnection.prototype,'close').mockImplementation(function(this:ExactConnection){this.emit('end');});
+ const rpc=vi.spyOn(ExactConnection.prototype,'callProcedure');
+ await expect(observeServiceCapture(base,root,loaded,approval(),guard(),procedure,new AbortController().signal)).rejects.toMatchObject({code:'CONNECTION_FAILED',technicalCode:'INVALID_TDS',outcome:'not_sent'});
+ const pending=await pendingServiceCase(base,root),dir=join(root,'cases',pending!.attemptId);
+ const diagnostic=JSON.parse(await readFile(join(dir,'diagnostic.json'),'utf8'));
+ expect(diagnostic).toMatchObject({errorCode:'INVALID_TDS',lastObservedStage:'TLS_HANDSHAKE_STARTED',rpcDispatchState:'NOT_OBSERVED'});
+ const proof=JSON.parse(await readFile(join(dir,'not-dispatched.json'),'utf8'));
+ expect(proof.diagnosticDigest).toBe(digest(diagnostic));expect(rpc).not.toHaveBeenCalled();expect(connect).toHaveBeenCalledTimes(1);
+ const saved=await readFile(join(base,'remote-pending.json'));
+ await expect(capture()).rejects.toThrow('RECOVERY_REQUIRED');
+ expect(await readFile(join(base,'remote-pending.json'))).toEqual(saved);
+ expect(JSON.stringify(diagnostic)).not.toContain('PRIVATE_');
 });

@@ -8,6 +8,7 @@ import {Readable} from 'node:stream';
 import {createRequire} from 'node:module';
 import {Collation} from 'tedious/lib/collation.js';
 import {ExactTokenParser,observeMetadata,type TdsField} from '../src/olos/tds/raw-parser.js';
+import {InspectionDiagnostics} from '../src/olos/tds/inspection-diagnostics.js';
 import {ExactConnection} from '../src/olos/tds/connection.js';
 import {parserLimits} from '../src/olos/tds/raw-parser.js';
 import {replayTdsResponse} from '../src/olos/tds/source.js';
@@ -113,4 +114,17 @@ it('inspection disk replay drains the full message before parsing rejects unsupp
  class RequestTokenHandler {}
  connection.createTokenStreamParser(Readable.from([unsupported.subarray(0,50),unsupported.subarray(50)]) as never,new RequestTokenHandler() as never);
  await failure;expect(failed).toBe(true);expect(observedType).toBe('Bit');expect(Buffer.concat(captured)).toEqual(unsupported);connection.close();
+});
+
+it.each(['stream','handler'] as const)('the per-connection parser preserves a safe technical failure from %s',async mode=>{
+ const connection=new ExactConnection({server:'127.0.0.1',options:{database:'phase3d_fixture',serverName:'localhost',encrypt:true,trustServerCertificate:false,cryptoCredentialsDetails:{ca:'synthetic-unused-offline'}}});
+ const diagnostics=new InspectionDiagnostics();connection.inspectionDiagnostics=diagnostics.observe;diagnostics.observe({kind:'stage',stage:'RPC_HANDOFF_STARTED'});
+ const failed=vi.fn();let finish!:()=>void;const done=new Promise<void>(resolve=>{finish=resolve;});
+ const original=Object.assign(Error('PRIVATE_PARSER_MESSAGE'),{code:'ERR_OUT_OF_RANGE'});
+ connection.acquisition={fields:undefined,limits:parserLimits,token(){if(mode==='handler')throw original;},fail(error){failed(error);finish();}};
+ class RequestTokenHandler{onColMetadata(){} onRow(){} onReturnValue(){} onReturnStatus(){} onDoneProc(){}}
+ const message=mode==='stream'?Readable.from((async function*(){throw original;yield Buffer.alloc(0);})()):Readable.from([response]);
+ connection.createTokenStreamParser(message as never,new RequestTokenHandler() as never);await done;
+ expect(failed).toHaveBeenCalledWith(original);expect(diagnostics.snapshot()).toMatchObject({errorCode:'ERR_OUT_OF_RANGE',rpcDispatchState:'DRIVER_HANDOFF_STARTED',remoteExecutionOutcome:'UNKNOWN',transport:expect.arrayContaining([expect.objectContaining({reason:'TOKEN_PARSER_FAILED',errorCode:'ERR_OUT_OF_RANGE'})])});
+ expect(JSON.stringify(diagnostics.snapshot())).not.toContain('PRIVATE_');connection.close();
 });
