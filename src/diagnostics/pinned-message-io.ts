@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { connect, type SecureContextOptions } from 'node:tls';
 import type { Duplex, Transform } from 'node:stream';
 import { assertOlosPinApproval, verifyPinnedPeer, pinError, type OlosPinApproval } from '../security/olos-certificate-pin.js';
@@ -17,6 +18,9 @@ export class PinnedMessageIO extends MessageIO {
   inspectionDiagnostics:InspectionDiagnosticObserver|undefined;
   private used = false;
   private initialMessage = true;
+  private observedPeerFingerprint: string | null = null;
+  /** Observation only, including rejected peers. Never an approval or proof of authentication. */
+  get remoteFingerprintSha256(): string | null { return this.observedPeerFingerprint; }
   constructor(...args: [...ConstructorParameters<typeof MessageIO>, OlosPinApproval]) {
     const [socket, size, debug, approval] = args;
     super(socket,size,debug); this.approval = approval;
@@ -63,11 +67,22 @@ export class PinnedMessageIO extends MessageIO {
       allowPartialTrustChain: true,
       checkServerIdentity: (_name, peer) => verifyPinnedPeer(this.approval,peer) });
     this.securePair = { cleartext: tls, encrypted: pair.socket2 };
+    const observePeer = () => {
+      if (this.observedPeerFingerprint !== null) return;
+      try {
+        const raw = tls.getPeerCertificate()?.raw;
+        if (Buffer.isBuffer(raw) && raw.length) this.observedPeerFingerprint = createHash('sha256').update(raw).digest('hex').toUpperCase().match(/../g)!.join(':');
+      } catch { /* Missing peer metadata must not change TLS validation or its original error. */ }
+    };
+    // Node's secure handler verifies the chain and can destroy the socket before
+    // emitting error/secureConnect. Observe only the hash before that handler.
+    tls.prependOnceListener('secure',observePeer);
     const incoming = (this as unknown as { incomingMessageStream: Transform }).incomingMessageStream;
     return new Promise<void>((resolve,reject) => {
       let finished = false;
       const cleanup = () => {
         pair.socket2.removeListener('readable',onReadable);tls.removeListener('secureConnect',onSecure);
+        tls.removeListener('secure',observePeer);
         this.socket.removeListener('error',onSocketError);this.socket.removeListener('end',onSocketEnd);this.socket.removeListener('close',onSocketClose);
       };
       const onSocketError=(error:Error)=>{reportTransportDiagnostic(this.inspectionDiagnostics,'TLS_SOCKET_ERROR',error);fail(error);};
@@ -75,6 +90,7 @@ export class PinnedMessageIO extends MessageIO {
       const onSocketClose=()=>{const error=pinError('ECONNRESET');reportTransportDiagnostic(this.inspectionDiagnostics,'TLS_SOCKET_CLOSED',error);fail(error);};
       const fail = (error: unknown) => {
         if (finished) return;
+        observePeer();
         reportTransportDiagnostic(this.inspectionDiagnostics,'TLS_HANDSHAKE_FAILED',error);
         finished = true; cleanup(); tls.destroy(); pair.socket2.destroy(); reject(error);
       };

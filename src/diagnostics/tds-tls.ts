@@ -6,6 +6,7 @@ import type { Transform } from 'node:stream';
 
 import { PinnedMessageIO } from './pinned-message-io.js';
 import { assertOlosPinApproval, type OlosPinApproval } from '../security/olos-certificate-pin.js';
+import { inspectionTechnicalErrorCode, type InspectionErrorCode, type InspectionStage } from '../olos/tds/inspection-diagnostics.js';
 
 const require = createRequire(import.meta.url);
 // Internal, read-only APIs: pinned and exercised against an isolated SQL Server.
@@ -29,7 +30,7 @@ export interface TlsDiagnosticOptions {
   host: string;
   port: number;
   serverName: string;
-  mode: 'verify' | 'inspect-unverified' | 'verify-pinned';
+  mode: 'verify' | 'inspect-unverified' | 'verify-pinned' | 'verify-corporate-pinned';
   pinApproval?: OlosPinApproval;
   ca?: string;
   timeoutMs?: number;
@@ -42,6 +43,7 @@ export interface TlsDiagnosticResult {
   /** Inspection is never an approval, even when the chain happens to verify. */
   chain: 'valid' | 'unverified' | 'not-assessed';
   name: 'match' | 'mismatch' | 'not-assessed';
+  pinnedDiagnostic?: { code: DiagnosticCode | InspectionErrorCode; stage: InspectionStage; fingerprintSha256: string | null };
 }
 class DiagnosticError extends Error {
   constructor(readonly code: DiagnosticCode) { super(code); }
@@ -85,12 +87,13 @@ function validate(options: TlsDiagnosticOptions): void {
   if (Object.keys(options).some(k => !['host','port','serverName','mode','ca','timeoutMs','pinApproval'].includes(k)) ||
     !isIP(options.host) || !Number.isInteger(options.port) || options.port < 1 || options.port > 65535 ||
     typeof options.serverName !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9.:-]{0,252}$/.test(options.serverName) ||
-    !['verify','inspect-unverified','verify-pinned'].includes(options.mode) ||
+    !['verify','inspect-unverified','verify-pinned','verify-corporate-pinned'].includes(options.mode) ||
     options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 50 || options.timeoutMs > 30000) ||
     options.ca !== undefined && (options.ca.length > 131072 || !/^(?:\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+$/.test(options.ca)) ||
     process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') throw new DiagnosticError('INVALID_CONFIGURATION');
-  if (options.mode === 'verify-pinned') {
-    if (!options.pinApproval || options.pinApproval.purpose !== 'OLOS_TDS_TLS_METADATA_ONLY' || options.host !== '10.196.234.11' || options.port !== 1433 || options.ca !== undefined) throw new DiagnosticError('INVALID_CONFIGURATION');
+  if (options.mode === 'verify-pinned' || options.mode === 'verify-corporate-pinned') {
+    const purpose = options.mode === 'verify-corporate-pinned' ? 'OLOS_ATTEMPTS_TDS_ACQUISITION' : 'OLOS_TDS_TLS_METADATA_ONLY';
+    if (!options.pinApproval || options.pinApproval.purpose !== purpose || options.host !== '10.196.234.11' || options.port !== 1433 || options.ca !== undefined) throw new DiagnosticError('INVALID_CONFIGURATION');
     assertOlosPinApproval(options.pinApproval);
   } else if (options.pinApproval !== undefined) throw new DiagnosticError('INVALID_CONFIGURATION');
   if (options.ca) {
@@ -102,11 +105,21 @@ function validate(options: TlsDiagnosticOptions): void {
 /** One TCP attempt, PRELOGIN + TLS only. No credentials, database, SQL or retry API. */
 export async function diagnoseTdsTls(options: TlsDiagnosticOptions, exportCertificate?: (pem: string) => Promise<void>): Promise<TlsDiagnosticResult> {
   const empty = { verified: false, chain: 'not-assessed', name: 'not-assessed' } as const;
-  try { validate(options); } catch (error) { return { ...empty, code: classifyTlsError(error) }; }
+  const corporate = options.mode === 'verify-corporate-pinned';
+  let stage: InspectionStage = 'AUTHORIZATION_STARTED';
+  let technicalCode: DiagnosticCode | InspectionErrorCode | undefined;
+  try {
+    validate(options);
+    if (corporate && exportCertificate) throw new DiagnosticError('INVALID_CONFIGURATION');
+  } catch (error) {
+    const code = classifyTlsError(error);
+    return { ...empty, code, ...(corporate ? { pinnedDiagnostic: {code: error instanceof DiagnosticError ? error.code : inspectionTechnicalErrorCode(error),stage,fingerprintSha256:null} } : {}) };
+  }
   const socket = new Socket();
-  const io = options.mode === 'verify-pinned'
+  const io = options.mode === 'verify-pinned' || corporate
     ? new PinnedMessageIO(socket,4096,new Debug(),options.pinApproval!)
     : new MessageIO(socket, 4096, new Debug());
+  if (corporate && io instanceof PinnedMessageIO) io.inspectionDiagnostics = event => { if (event.kind === 'stage') stage = event.stage; };
   // This private stream belongs solely to this instance; never mutate driver prototypes.
   const incoming = (io as unknown as { incomingMessageStream: Transform }).incomingMessageStream;
   let phase: 'prelogin' | 'tls' = 'prelogin';
@@ -130,9 +143,13 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions, exportCertif
   timer = setTimeout(() => fail(new DiagnosticError('TIMEOUT')), options.timeoutMs ?? 10000);
   try {
     const work = async (): Promise<TlsDiagnosticResult> => {
+      stage = 'CONNECTION_INIT_STARTED';
       await new Promise<void>(resolve => { socket.once('connect', resolve); socket.connect(options.port, options.host); });
+      stage = 'SOCKET_CONNECTED';
       io.sendMessage(0x12, new PreloginPayload({ encrypt: true, version: { major: 18, minor: 6, build: 2, subbuild: 0 } }).data);
+      stage = 'PRELOGIN_SENT';
       const response = await io.readMessage();
+      stage = 'PRELOGIN_RESPONSE_RECEIVED';
       if (response.type !== 0x04) throw new DiagnosticError('INVALID_TDS');
       const chunks: Buffer[] = [];
       let size = 0;
@@ -143,6 +160,7 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions, exportCertif
       }
       if (![1,3].includes(encryptionFromPrelogin(Buffer.concat(chunks)))) throw new DiagnosticError('TLS_NOT_SUPPORTED');
       phase = 'tls';
+      stage = 'TLS_HANDSHAKE_STARTED';
       // TDS 7.x with this pinned driver supports TLS 1.2. No legacy fallback/cipher override.
       await io.startTls({ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2', ...(options.ca ? { ca: options.ca } : {}) },
         options.serverName, options.mode === 'inspect-unverified');
@@ -150,6 +168,7 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions, exportCertif
       const cert = tls?.getPeerCertificate();
       if (!tls || !cert?.raw) throw new DiagnosticError('CERT_INVALID');
       if (exportCertificate) certificatePem = new X509Certificate(cert.raw).toString();
+      if (corporate) return { code: 'PIN_VERIFIED', verified: true, identity: 'certificate-sha256-pin', chain: 'valid', name: 'not-assessed' };
       if (options.mode === 'verify-pinned') return { code: 'PIN_VERIFIED', verified: true, identity: 'certificate-sha256-pin',
         certificate: publicCertificate(cert.raw), chain: 'valid', name: checkServerIdentity(options.serverName,cert) ? 'mismatch' : 'match' };
       const matches = checkServerIdentity(options.serverName, cert) === undefined;
@@ -161,6 +180,7 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions, exportCertif
   } catch (error) {
     // OpenSSL errors have stable codes; do not expose messages/stacks, certificate dumps or wire buffers.
     const code = classifyTlsError(error);
+    technicalCode = error instanceof DiagnosticError ? error.code : inspectionTechnicalErrorCode(error,'CONNECTION_FAILED');
     result = { ...empty, code: phase === 'prelogin' && code === 'TLS_INCOMPATIBLE' ? 'INVALID_TDS' : code };
   } finally {
     clearTimeout(timer);
@@ -172,6 +192,7 @@ export async function diagnoseTdsTls(options: TlsDiagnosticOptions, exportCertif
     io.outgoingMessageStream.destroy();
     socket.destroy();
   }
+  if (corporate) return { ...result, pinnedDiagnostic: {code:technicalCode ?? result.code,stage,fingerprintSha256:io instanceof PinnedMessageIO ? io.remoteFingerprintSha256 : null} };
   // Export only after the diagnostic transport is closed. PEM never enters the JSON result.
   if (exportCertificate && certificatePem && result.certificate) {
     try { await exportCertificate(certificatePem); }

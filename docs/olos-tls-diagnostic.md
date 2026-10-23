@@ -26,6 +26,45 @@ Orçamento total de 10 segundos, 256 KiB recebidos e 16 KiB para a resposta inic
 
 ## Modos e resultado
 
+### Diagnóstico com a aprovação corporativa existente
+
+`verify-corporate-pinned` aceita a aprovação `OLOS_ATTEMPTS_TDS_ACQUISITION` já usada pelo V2, carregada por `loadOlosPinApproval()`. O modo anterior `verify-pinned` continua restrito à aprovação de metadados. Não criar ou editar aprovações para executar este diagnóstico.
+
+O novo modo instancia o próprio `PinnedMessageIO` corporativo: TLS 1.2, `rejectUnauthorized: true`, `ca` igual ao PEM aprovado, `allowPartialTrustChain: true` e verificação do pin SHA-256. Executa uma conexão PRELOGIN/TLS com timeout total de 10 segundos. Não instancia `Connection`/`Request`, não lê credenciais SQL e não envia LOGIN7, consultas ou RPC. Não usa scheduler, PostgreSQL, spool ou recuperação. Não exporta certificados nem escreve arquivos.
+
+No checkout, apontar `OLOS_EXISTING_PIN_APPROVAL_FILE` para o mesmo arquivo indicado em `pinApprovalFile` na configuração V2. A variável abaixo é apenas um caminho local; nenhuma aprovação é criada:
+
+```bash
+SYNC_ENABLED=false npm run --silent diagnose:olos-tls -- \
+  --authorize TDS_TLS_METADATA_ONLY \
+  --mode verify-corporate-pinned \
+  --server-name 10.196.234.11 \
+  --pin-approval-file "${OLOS_EXISTING_PIN_APPROVAL_FILE:?Defina o caminho da aprovacao existente}"
+```
+
+Na imagem de produção que contenha esta alteração, o equivalente é `node dist/cli/adapters/olos-tls-diagnostic.js` seguido dos mesmos argumentos, com `SYNC_ENABLED=false`. Usar o caminho da aprovação **dentro do container**, já montado para o worker; não alterar mounts ou permissões. Nenhum comando contra a Olos foi executado durante esta implementação.
+
+A saída desse modo contém exclusivamente `code`, `stage` e `fingerprintSha256` do certificado **remoto**, ou `null` quando indisponível. Exemplo de falha, com o hash omitido neste exemplo:
+
+```json
+{"code":"DEPTH_ZERO_SELF_SIGNED_CERT","stage":"TLS_HANDSHAKE_STARTED","fingerprintSha256":null}
+```
+
+O hash é observado antes de o [handler TLS do Node 22.23.4](https://github.com/nodejs/node/blob/v22.23.4/lib/internal/tls/wrap.js#L1663-L1711) encerrar a sessão rejeitada. A observação usa o evento interno `secure`, sem substituir a validação da cadeia ou do pin; essa dependência requer regressão ao atualizar Node. Não imprime PEM, subject, issuer, mensagens de erro, stacks ou bytes TLS/TDS. Códigos técnicos conhecidos são preservados, incluindo `DEPTH_ZERO_SELF_SIGNED_CERT`, `CERT_HAS_EXPIRED` e `PIN_MISMATCH`; erros desconhecidos recebem código fixo sanitizado.
+
+Comparar externamente o hash retornado com o aprovado `9F:48:BD:96:77:FE:38:C9:76:68:44:C8:50:EE:4F:07:22:D1:AD:5F:E6:83:F7:8F:2F:88:D4:B9:CA:93:1E:37`:
+
+- Hash diferente: o certificado observado nessa conexão difere do aprovado. Não renovar a aprovação automaticamente; investigar endpoint/certificado apresentado.
+- Hash igual com erro: a hipótese de substituição do certificado não explica essa sessão; a falha de validação continua vigente e requer investigação do contexto TLS efetivo.
+- `null`: certificado indisponível; não concluir igualdade ou divergência.
+- `PIN_VERIFIED` / `TLS_VALIDATED`: autenticação concluída nessa conexão. Não autoriza aquisição, não encerra tentativas pendentes e não altera recovery.
+
+Exit 0 somente em `PIN_VERIFIED`; exit 1 em falha de transporte/TLS; exit 64 em rejeição local de argumentos/aprovação. Não há retry ou fallback para outro modo.
+
+Validação desta alteração: 147 testes direcionados em oito arquivos, incluindo 13 novos casos em `test/corporate-tls-diagnostic.test.ts`, typecheck e build aprovados em Node.js 22.23.4 / OpenSSL 3.5.9 / Tedious 18.6.2. O novo peer sintético comprova uma conexão, apenas pacotes PRELOGIN e zero bytes de aplicação após TLS. `DEPTH_ZERO_SELF_SIGNED_CERT` foi reproduzido com certificado remoto diferente do aprovado, preservando seu hash; isso não demonstra divergência do certificado na Olos real. A CLI compilada também recusou aprovação ausente com exit 64 e somente os três campos previstos, antes de conectar.
+
+### Modos anteriores
+
 | Modo | Validação TLS | Resultado |
 |---|---|---|
 | `verify` (padrão) | `rejectUnauthorized=true`; cadeia, validade e nome esperado verificados pelo Node; checagem explícita adicional do nome | `VERIFIED`, `verified=true`, exit 0 somente em sucesso |

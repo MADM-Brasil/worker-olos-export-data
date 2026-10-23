@@ -18,10 +18,12 @@ export function parseTlsArguments(args: readonly string[], env: NodeJS.ProcessEn
   if (flags.get('--authorize') !== 'TDS_TLS_METADATA_ONLY') throw new Error('OPERATIONAL_AUTHORIZATION_REQUIRED');
   const mode = flags.get('--mode') ?? 'verify';
   const serverName = flags.get('--server-name');
-  if (!['verify','inspect-unverified','verify-pinned'].includes(mode) || !serverName || !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$/.test(serverName)) throw new Error('INVALID_CONFIGURATION');
-  if ((mode === 'verify-pinned') !== flags.has('--pin-approval-file') || mode === 'verify-pinned' && flags.has('--ca-file')) throw new Error('INVALID_CONFIGURATION');
+  if (!['verify','inspect-unverified','verify-pinned','verify-corporate-pinned'].includes(mode) || !serverName || !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$/.test(serverName)) throw new Error('INVALID_CONFIGURATION');
+  const pinned = mode === 'verify-pinned' || mode === 'verify-corporate-pinned';
+  if (pinned !== flags.has('--pin-approval-file') || pinned && flags.has('--ca-file')) throw new Error('INVALID_CONFIGURATION');
   const options: TlsDiagnosticOptions = { host: '10.196.234.11', port: 1433, serverName, mode: mode as TlsDiagnosticOptions['mode'], timeoutMs: 10000 };
   const exportFile = flags.get('--export-certificate-pem');
+  if (mode === 'verify-corporate-pinned' && exportFile !== undefined) throw new Error('INVALID_CONFIGURATION');
   if (exportFile !== undefined && (!isAbsolute(exportFile) || resolve(exportFile) !== exportFile)) throw new Error('INVALID_CONFIGURATION');
   return { options, ...(flags.has('--ca-file') ? { caFile: flags.get('--ca-file')! } : {}), ...(flags.has('--pin-approval-file') ? { pinFile: flags.get('--pin-approval-file')! } : {}), ...(exportFile ? { exportFile } : {}) };
 }
@@ -44,9 +46,10 @@ async function prepareCertificateExport(path: string) {
   };
 }
 const help = `Diagnóstico manual TDS PRELOGIN/TLS; nunca envia LOGIN7, SQL ou credenciais.
-SYNC_ENABLED=false npm run diagnose:olos-tls -- --authorize TDS_TLS_METADATA_ONLY --server-name <nome-esperado> [--mode verify|inspect-unverified|verify-pinned] [--ca-file /caminho/ca-publica.pem | --pin-approval-file /caminho/privado/aprovacao.json] [--export-certificate-pem /diretorio/privado/certificado.pem]
+SYNC_ENABLED=false npm run diagnose:olos-tls -- --authorize TDS_TLS_METADATA_ONLY --server-name <nome-esperado> [--mode verify|inspect-unverified|verify-pinned|verify-corporate-pinned] [--ca-file /caminho/ca-publica.pem | --pin-approval-file /caminho/privado/aprovacao.json] [--export-certificate-pem /diretorio/privado/certificado.pem]
 Destino fixo: 10.196.234.11:1433. Uma conexão, timeout total 10s, sem retry.
 verify-pinned: exige --pin-approval-file /caminho/privado/aprovacao.json; autentica o certificado por pin aprovado, sem LOGIN7/SQL.
+verify-corporate-pinned: reutiliza a aprovação OLOS_ATTEMPTS_TDS_ACQUISITION e o PinnedMessageIO corporativo; saída somente code, stage e fingerprintSha256 remoto (ou null). Não exporta certificados.
 verify (padrão): exige cadeia confiável, validade e nome compatível.
 inspect-unverified: exclusivamente informativo, sem autenticar a identidade do servidor.
 Exportação explícita: somente certificado público folha, arquivo novo 0600 em diretório privado existente do usuário; nunca aprova pin e nunca imprime PEM.
@@ -74,11 +77,18 @@ export async function runTlsCli(args: readonly string[], env: NodeJS.ProcessEnv)
     }
     if (config.exportFile) exporter = await prepareCertificateExport(config.exportFile);
   } catch {
-    process.stdout.write(`${JSON.stringify({ code: 'CONFIGURATION_OR_AUTHORIZATION_REJECTED', verified: false })}\n`);
+    process.stdout.write(`${JSON.stringify(args.includes('verify-corporate-pinned')
+      ? {code:'CONFIGURATION_OR_AUTHORIZATION_REJECTED',stage:'AUTHORIZATION_STARTED',fingerprintSha256:null}
+      : { code: 'CONFIGURATION_OR_AUTHORIZATION_REJECTED', verified: false })}\n`);
     return 64;
   }
   try {
     const result = await diagnoseTdsTls(config.options,exporter?.save);
+    if (config.options.mode === 'verify-corporate-pinned') {
+      const diagnostic = result.pinnedDiagnostic;
+      process.stdout.write(`${JSON.stringify(diagnostic ?? {code:'DIAGNOSTIC_FAILED',stage:'UNKNOWN',fingerprintSha256:null})}\n`);
+      return diagnostic?.code === 'PIN_VERIFIED' ? 0 : 1;
+    }
     // Restrict displayed certificate fields; the existing core metadata API retains SAN.
     const certificate = result.certificate && (({subject,issuer,validFrom,validTo,fingerprintSha256}) =>
       ({subject,issuer,validFrom,validTo,fingerprintSha256}))(result.certificate);
@@ -88,6 +98,8 @@ export async function runTlsCli(args: readonly string[], env: NodeJS.ProcessEnv)
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   runTlsCli(process.argv.slice(2), process.env).then(code => { process.exitCode = code; }).catch(() => {
-    process.stdout.write('{"code":"DIAGNOSTIC_FAILED","verified":false}\n'); process.exitCode = 1;
+    process.stdout.write(`${JSON.stringify(process.argv.includes('verify-corporate-pinned')
+      ? {code:'DIAGNOSTIC_FAILED',stage:'UNKNOWN',fingerprintSha256:null}
+      : {code:'DIAGNOSTIC_FAILED',verified:false})}\n`); process.exitCode = 1;
   });
 }
