@@ -18,13 +18,93 @@ export const localReconciliationApprovalSchema=z.object({
 export type LocalReconciliationApproval=z.infer<typeof localReconciliationApprovalSchema>;
 const refuse=():never=>{throw new PersistenceError('RECOVERY_REQUIRED');};
 
+/** Valida lotes anteriores confirmados sem avançar o checkpoint de entrega. */
+async function validatePriorIngestion(
+  c: PoolClient,
+  streamId: string,
+  expectedVersion: string,
+  expectedCursor: string | null,
+  checkpointVersion: string,
+  checkpointCursor: string | null
+): Promise<readonly string[]> {
+  const rows = (await c.query<{
+    id:string;
+    expected_version:string;
+    previous_cursor:string|null;
+    next_cursor:string|null;
+    state:string;
+    received_count:number;
+    persisted_count:number;
+    duplicate_count:number;
+    rejected_count:number;
+    manifest_digest:string|null;
+    data_digest:string|null;
+    record_count:number|null;
+    format_version:string|null;
+    projection_count:string;
+    total_projection_count:string;
+  }>(`
+    SELECT b.id,b.expected_version::text,b.previous_cursor,b.next_cursor,b.state,
+           b.received_count,b.persisted_count,b.duplicate_count,b.rejected_count,
+           x.manifest_digest,x.data_digest,x.record_count,x.format_version,
+           (SELECT count(*)::text
+            FROM olos_export.projection_batches p
+            WHERE p.batch_id=b.id
+              AND p.source_table=b.source_table
+              AND p.destination_id='local.olos_worker.raw.olos_calls'
+              AND p.source_namespace='olos.ExportDataV3.AttemptsRawData'
+              AND p.mapping_version='local-approved-16/v1'
+              AND p.source_contract_version=r.contract_version
+              AND p.config_digest ~ '^[a-f0-9]{64}$'
+              AND p.snapshot_digest ~ '^[a-f0-9]{64}$'
+              AND p.row_count>=0) AS projection_count,
+           (SELECT count(*)::text
+            FROM olos_export.projection_batches p
+            WHERE p.batch_id=b.id) AS total_projection_count
+    FROM olos_export.batches b
+    JOIN olos_export.runs r ON r.id=b.run_id
+    LEFT JOIN olos_export.large_batch_receipts x ON x.batch_id=b.id
+    WHERE b.stream_id=$1
+    ORDER BY b.expected_version,b.id
+    FOR SHARE OF b
+  `,[streamId])).rows;
+
+  let version = BigInt(checkpointVersion);
+  let cursor = checkpointCursor;
+
+  for (const row of rows) {
+    if (
+      BigInt(row.expected_version) !== version ||
+      row.previous_cursor !== cursor ||
+      row.state !== 'committed' ||
+      row.received_count !== row.persisted_count + row.duplicate_count ||
+      row.rejected_count !== 0 ||
+      row.record_count !== row.received_count ||
+      row.format_version !== 'olos-spool/v1' ||
+      !/^[a-f0-9]{64}$/.test(row.manifest_digest ?? '') ||
+      !/^[a-f0-9]{64}$/.test(row.data_digest ?? '') ||
+      row.projection_count !== '1' ||
+      row.total_projection_count !== '1'
+    ) refuse();
+
+    version++;
+    cursor = row.next_cursor;
+  }
+
+  if (version !== BigInt(expectedVersion) || cursor !== expectedCursor) refuse();
+
+  return rows.map(row => row.id);
+}
+
+
 /** Source-row lock is the transaction completion barrier, not receipt absence alone.
- * Only the initial (version zero) sealed AttemptsRawData ingestion is supported.
+ * Previous committed ingestion must form a verified contiguous sequence.
  * The open original case blocks normal startRun throughout preparation/replay. */
 export async function reconcileLocalIngestion(pool:Pick<Pool,'connect'>,spool:SpoolRepository,m:SpoolManifest,input:unknown,signal:AbortSignal):Promise<RunHandle>{
  const a=localReconciliationApprovalSchema.parse(input),i=m.identity;
  if(signal.aborted || !m.sealed || !['uncertain','persisting','sealed','committed'].includes(m.state) ||
-   i.plan.run.table!=='AttemptsRawData' || i.expected.version!=='0' || i.expected.cursor!==null ||
+   i.plan.run.table!=='AttemptsRawData' || (!/^(0|[1-9][0-9]*)$/.test(i.expected.version) ||
+    BigInt(i.expected.version)>BigInt(Number.MAX_SAFE_INTEGER)) || i.expected.cursor!==null ||
    a.batchId!==i.batchId || a.runId!==i.runId || a.manifestDigest!==manifestDigest(m) ||
    Date.parse(a.authorizedAt)>Date.now() || Date.parse(a.expiresAt)<=Date.now() ||
    Date.parse(a.expiresAt)-Date.parse(a.authorizedAt)>86400000)refuse();
@@ -68,10 +148,19 @@ export async function reconcileLocalIngestion(pool:Pick<Pool,'connect'>,spool:Sp
     WHERE u.source_table='AttemptsRawData' AND r.state='open' AND NOT(u.id=ANY($1::uuid[])) LIMIT 1`,[allowed])).rowCount)refuse();
   const cp=(await c.query('SELECT * FROM olos_export.checkpoints WHERE stream_id=$1 FOR UPDATE NOWAIT',[i.streamId])).rows[0];
   if(!cp || cp.version!=='0' || cp.cursor_value!==null || cp.last_batch_id!==null || cp.last_success_at!==null)throw new PersistenceError('CHECKPOINT_CONFLICT');
+  const priorBatchIds = await validatePriorIngestion(
+    c,
+    i.streamId,
+    i.expected.version,
+    i.expected.cursor,
+    cp.version,
+    cp.cursor_value
+  );
+
   // Check all provenance roots and their descendants, including receipts/outbox/audit/envelopes.
   // FKs + atomic ingestion mean delivery cannot precede a committed projection batch.
   const effects=(await c.query(`SELECT
-    EXISTS(SELECT 1 FROM olos_export.batches WHERE id=$1 OR run_id=ANY($2::uuid[]) OR stream_id=$3) OR
+    EXISTS(SELECT 1 FROM olos_export.batches WHERE id=$1 OR run_id=ANY($2::uuid[])) OR
     EXISTS(SELECT 1 FROM olos_export.large_batch_receipts WHERE batch_id=$1) OR
     EXISTS(SELECT 1 FROM olos_export.large_batch_keys WHERE batch_id=$1) OR
     EXISTS(SELECT 1 FROM olos_export.attempts_raw_data WHERE last_batch_id=$1) OR
@@ -80,13 +169,13 @@ export async function reconcileLocalIngestion(pool:Pick<Pool,'connect'>,spool:Sp
     EXISTS(SELECT 1 FROM olos_export.projection_events e JOIN olos_export.projection_outbox o ON o.delivery_id=e.delivery_id WHERE o.batch_id=$1) OR
     EXISTS(SELECT 1 FROM olos_export.delivery_receipts d JOIN olos_export.projection_outbox o ON o.delivery_id=d.delivery_id AND o.destination_id=d.destination_id WHERE o.batch_id=$1) OR
     EXISTS(SELECT 1 FROM olos_export.audit_events WHERE (run_id=ANY($2::uuid[]) OR batch_id=$1) AND event='batch_committed') OR
-    EXISTS(SELECT 1 FROM olos_export.sync_errors WHERE run_id=ANY($2::uuid[]) AND (batch_id IS NOT NULL OR received_count<>0 OR rejected_count<>0)) AS present`,[i.batchId,allowed,i.streamId])).rows[0];
+    EXISTS(SELECT 1 FROM olos_export.sync_errors WHERE run_id=ANY($2::uuid[]) AND (batch_id IS NOT NULL OR received_count<>0 OR rejected_count<>0)) AS present`,[i.batchId,allowed])).rows[0];
   if(effects.present)refuse();
   const contract=(await c.query<SourceContract>('SELECT * FROM olos_export.source_contracts WHERE source_table=$1 AND version=$2',[i.plan.run.table,i.plan.contract.version])).rows[0];
   if(!contract || canonical(contract)!==canonical(i.plan.contract))refuse();assertContract(contract!);
   if(signal.aborted || Date.parse(a.expiresAt)<=Date.now())refuse();
   const runId=randomUUID(),token=(BigInt(lock.generation)+1n).toString();
-  const proof={protocol:'source-lock-barrier/v1',generation:lock.generation,checkpoint:{version:'0',cursor:null,lastBatchId:null},effectsAbsent:true,originalRunId:i.runId,previousRecoveryRuns:previous,manifestDigest:manifestDigest(m)};
+  const proof={protocol:'source-lock-barrier/v1',generation:lock.generation,checkpoint:{version:'0',cursor:null,lastBatchId:null},effectsAbsent:true,priorBatchIds,originalRunId:i.runId,previousRecoveryRuns:previous,manifestDigest:manifestDigest(m)};
   // All proof checks completed. Proof and new local identity commit atomically.
   await c.query(`INSERT INTO olos_export.runs(id,stream_id,source_table,contract_version,fencing_token,state,pk_range)
     VALUES ($1,$2,'AttemptsRawData',$3,$4,'read_intent',$5::jsonb)`,[runId,i.streamId,i.plan.run.contractVersion,token,JSON.stringify(i.plan.run.pkRange)]);

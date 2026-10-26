@@ -20,7 +20,7 @@ import {parseCorporateArguments} from '../adapters/attempts-corporate.js';
 
 let fixture:Awaited<ReturnType<typeof isolatedPostgres>>,pool:Pool,root:string,spool:LocalSpool,core:PostgresPersistence,writer:PostgresLargeBatchPersistence,m:SpoolManifest,a:LocalReconciliationApproval;
 const limits=spoolLimits({minFreeBytes:0,chunkRows:2,bufferBytes:1024}),signal=()=>new AbortController().signal;
-const projection={sourceNamespace:'synthetic-local-recovery',destinationId:'synthetic-local-recovery',mappingVersion:'fixture/v1'};
+const projection={sourceNamespace:'olos.ExportDataV3.AttemptsRawData',destinationId:'local.olos_worker.raw.olos_calls',mappingVersion:'local-approved-16/v1'};
 beforeAll(async()=>{
  fixture=await isolatedPostgres();
  for(const f of ['migrations/003_projection_control.sql','permissions/projection.sql','migrations/004_delivery_receipts.sql','migrations/005_large_batch_control.sql','permissions/large-batch.sql','migrations/007_local_ingestion_reconciliation.sql','permissions/local-ingestion-reconciliation.sql'])await fixture.admin.query(await readFile(new URL('../'+f,import.meta.url),'utf8'));
@@ -156,4 +156,203 @@ it('lease expiring during projection finalization rolls back instead of committi
  const shortLeaseWriter=new PostgresLargeBatchPersistence(pool,limits,200,projection,true,true);
  await expect(shortLeaseWriter.persistReconciled(m,h,()=>spool.records(m))).rejects.toMatchObject({code:'LEASE_LOST'});
  expect((await stats()).batches).toBe(0);expect((await stats()).checkpoint).toBe('0');
+});
+
+
+
+it.each([
+  'receipt-count-mismatch',
+  'wrong-mapping',
+  'extra-projection',
+  'broken-sequence'
+])('refuses version one when prior ingestion has %s',async fault=>{
+  const first=m;
+  const h=await prepare();
+  await replay(h);
+  await spool.mark(first,'committed');
+
+  const secondSpool=await LocalSpool.open(join(root,'negative-second'),limits);
+  const control={
+    startRun:core.startRun.bind(core),
+    checkpoint:writer.ingestionCheckpoint.bind(writer),
+    renew:core.renew.bind(core),
+    recoverExpired:core.recoverExpired.bind(core)
+  };
+  const failing={
+    preflight:writer.preflight.bind(writer),
+    persist:async()=>{throw new PersistenceError('LEASE_LOST');}
+  };
+
+  await expect(
+    new LargeBatchCoordinator(control,secondSpool,failing,limits)
+      .receive(largePlan(),rawSource(7,{duplicate:true}),signal())
+  ).rejects.toMatchObject({code:'LEASE_LOST'});
+
+  spool=secondSpool;
+  m=(await spool.active())!;
+  expect(m.identity.expected.version).toBe('1');
+
+  await fixture.admin.query(
+    "UPDATE olos_export.source_locks SET lease_until=clock_timestamp()-interval '1 second'"
+  );
+  const [caseId]=await core.recoverExpired();
+
+  const generation=(await fixture.admin.query(
+    "SELECT generation::text FROM olos_export.source_locks WHERE source_table='AttemptsRawData'"
+  )).rows[0].generation as string;
+
+  a={
+    ...a,
+    authorizationId:randomUUID(),
+    captureId:randomUUID(),
+    batchId:m.identity.batchId,
+    runId:m.identity.runId,
+    recoveryCaseId:caseId!,
+    manifestDigest:manifestDigest(m),
+    expectedGeneration:generation,
+    authorizedAt:new Date().toISOString(),
+    expiresAt:new Date(Date.now()+3600000).toISOString()
+  };
+
+  if(fault==='receipt-count-mismatch'){
+    // Simula inconsistência entre o contador do lote e o recibo.
+    await fixture.admin.query(
+      'UPDATE olos_export.large_batch_receipts SET record_count=record_count+1 WHERE batch_id=$1',
+      [first.identity.batchId]
+    );
+  }
+
+  if(fault==='wrong-mapping'){
+    // Mantém intactas as chaves estrangeiras; altera somente
+    // a identidade de mapeamento para um valor não aprovado.
+    await fixture.admin.query(
+      'UPDATE olos_export.projection_batches SET mapping_version=$2 WHERE batch_id=$1',
+      [first.identity.batchId,'unapproved.mapping/v1']
+    );
+  }
+
+  if(fault==='extra-projection'){
+    // Segunda projeção válida para outro destino: deve ser recusada.
+    await fixture.admin.query(`
+      INSERT INTO olos_export.projection_batches(
+        batch_id,destination_id,source_table,source_namespace,
+        source_contract_version,field_definitions,destination_version,
+        mapping_version,config_digest,snapshot_digest,row_count
+      )
+      SELECT batch_id,'unapproved.extra.destination',source_table,
+             source_namespace,source_contract_version,field_definitions,
+             destination_version,mapping_version,config_digest,
+             snapshot_digest,row_count
+      FROM olos_export.projection_batches
+      WHERE batch_id=$1
+    `,[first.identity.batchId]);
+  }
+
+  if(fault==='broken-sequence'){
+    await fixture.admin.query(
+      'UPDATE olos_export.batches SET expected_version=5 WHERE id=$1',
+      [first.identity.batchId]
+    );
+  }
+
+  await expect(prepare()).rejects.toMatchObject({code:'RECOVERY_REQUIRED'});
+  expect((await fixture.admin.query(
+    'SELECT count(*)::int AS total FROM olos_export.local_ingestion_reconciliations'
+  )).rows[0].total).toBe(1);
+});
+
+it('recovers version one after a prior committed batch without advancing delivery checkpoint',async()=>{
+  // Primeiro lote: materializado, mas ainda não entregue.
+  const firstManifest=m;
+  const firstHandle=await prepare();
+  await replay(firstHandle);
+  await spool.mark(firstManifest,'committed');
+
+  const originalBatch=(await fixture.admin.query(
+    'SELECT * FROM olos_export.batches WHERE id=$1',
+    [firstManifest.identity.batchId]
+  )).rows[0];
+
+  const originalReceipt=(await fixture.admin.query(
+    'SELECT * FROM olos_export.large_batch_receipts WHERE batch_id=$1',
+    [firstManifest.identity.batchId]
+  )).rows[0];
+
+  expect((await stats()).checkpoint).toBe('0');
+
+  // Segunda captura usa o tip de ingestão, não o checkpoint de entrega.
+  const secondSpool=await LocalSpool.open(join(root,'second-capture'),limits);
+  const control={
+    startRun:core.startRun.bind(core),
+    checkpoint:writer.ingestionCheckpoint.bind(writer),
+    renew:core.renew.bind(core),
+    recoverExpired:core.recoverExpired.bind(core)
+  };
+
+  const failing={
+    preflight:writer.preflight.bind(writer),
+    persist:async()=>{throw new PersistenceError('LEASE_LOST');}
+  };
+
+  await expect(
+    new LargeBatchCoordinator(control,secondSpool,failing,limits)
+      .receive(largePlan(),rawSource(7,{duplicate:true}),signal())
+  ).rejects.toMatchObject({code:'LEASE_LOST'});
+
+  spool=secondSpool;
+  m=(await spool.active())!;
+
+  expect(m.identity.expected.version).toBe('1');
+  expect(m.identity.expected.cursor).toBeNull();
+
+  await fixture.admin.query(
+    "UPDATE olos_export.source_locks SET lease_until=clock_timestamp()-interval '1 second'"
+  );
+
+  const [caseId]=await core.recoverExpired();
+  expect(caseId).toBeTruthy();
+
+  const generation=(await fixture.admin.query(
+    "SELECT generation::text FROM olos_export.source_locks WHERE source_table='AttemptsRawData'"
+  )).rows[0].generation as string;
+
+  a={
+    ...a,
+    authorizationId:randomUUID(),
+    captureId:randomUUID(),
+    batchId:m.identity.batchId,
+    runId:m.identity.runId,
+    recoveryCaseId:caseId!,
+    manifestDigest:manifestDigest(m),
+    expectedGeneration:generation,
+    authorizedAt:new Date().toISOString(),
+    expiresAt:new Date(Date.now()+3600000).toISOString()
+  };
+
+  // Nenhuma prova deve avançar a entrega.
+  const handle=await prepare();
+  expect(handle.runId).not.toBe(m.identity.runId);
+  expect((await stats()).checkpoint).toBe('0');
+
+  await replay(handle);
+
+  const secondBatch=(await fixture.admin.query(
+    'SELECT * FROM olos_export.batches WHERE id=$1',
+    [m.identity.batchId]
+  )).rows[0];
+
+  expect(secondBatch.state).toBe('committed');
+  expect(secondBatch.expected_version).toBe('1');
+  expect((await stats()).checkpoint).toBe('0');
+
+  // Lote anterior permanece intacto.
+  expect((await fixture.admin.query(
+    'SELECT * FROM olos_export.batches WHERE id=$1',
+    [firstManifest.identity.batchId]
+  )).rows[0]).toEqual(originalBatch);
+
+  expect((await fixture.admin.query(
+    'SELECT * FROM olos_export.large_batch_receipts WHERE batch_id=$1',
+    [firstManifest.identity.batchId]
+  )).rows[0]).toEqual(originalReceipt);
 });
