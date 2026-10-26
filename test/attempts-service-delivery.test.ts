@@ -1,16 +1,17 @@
+import {AttemptsCycleRunner} from '../src/integration/attempts/cycle-runner.js';
 import {beforeAll,afterAll,beforeEach,afterEach,it,expect,vi} from 'vitest';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {existsSync} from 'node:fs';
 import {join} from 'node:path';
-import {randomUUID} from 'node:crypto';
+import {randomUUID,createHash} from 'node:crypto';
 import pg from 'pg';
 import {isolatedPostgres} from './support/postgres.js';
 import {fields,responseForIds,collation} from './support/activation-capture.js';
 import {LocalSpool} from '../adapters/local-spool.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 import {attemptsFixturePlan,signature} from '../src/integration/attempts/contracts.js';
-import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle,createServiceCaptureQueue,observeServiceCapture,reconcileServiceIngestion} from '../adapters/attempts-service.js';
+import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle,createServiceCaptureQueue,observeServiceCapture,reconcileServiceIngestion,discardServiceCapture} from '../adapters/attempts-service.js';
 import {serviceConfigSchema,planForCapture,type ContractReview} from '../src/integration/attempts/activation.js';
 import {exampleProfile,columnTypes} from '../src/offline/model.js';
 import {APPROVED_COLUMNS,IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
@@ -28,7 +29,7 @@ let fixture:Awaited<ReturnType<typeof isolatedPostgres>>,root:string,captureDate
 let pools:{ingest:pg.Pool;project:pg.Pool;receiver:pg.Pool};
 beforeAll(async()=>{
  fixture=await isolatedPostgres();
- for(const f of ['migrations/003_projection_control.sql','permissions/projection.sql','migrations/005_large_batch_control.sql','permissions/large-batch.sql','migrations/004_delivery_receipts.sql','permissions/receiver.sql','migrations/007_local_ingestion_reconciliation.sql','permissions/local-ingestion-reconciliation.sql'])await fixture.admin.query(await readFile(new URL('../'+f,import.meta.url),'utf8'));
+ for(const f of ['migrations/003_projection_control.sql','permissions/projection.sql','migrations/005_large_batch_control.sql','permissions/large-batch.sql','migrations/004_delivery_receipts.sql','permissions/receiver.sql','migrations/007_local_ingestion_reconciliation.sql','permissions/local-ingestion-reconciliation.sql','migrations/008_administrative_capture_discard.sql','permissions/administrative-capture-discard.sql'])await fixture.admin.query(await readFile(new URL('../'+f,import.meta.url),'utf8'));
  await fixture.admin.query('CREATE SCHEMA raw');
  await fixture.admin.query(`CREATE TABLE raw.olos_calls(${APPROVED_COLUMNS.map(c=>`"${c}" ${columnTypes[c]} ${c==='internal_id_olos'?'PRIMARY KEY':''}`).join(',')})`);
  await fixture.admin.query('GRANT USAGE ON SCHEMA raw TO olos_export_receiver');await fixture.admin.query('GRANT SELECT,INSERT ON raw.olos_calls TO olos_export_receiver');
@@ -67,6 +68,114 @@ async function activationRequest(current:Awaited<ReturnType<typeof prepared>>,pr
   contractDigests:{ReadDataCurrentDay:digest(current.review),ReadDataPreviousDays:digest(previous.review)},captureIds:{ReadDataCurrentDay:current.intent.attemptId,ReadDataPreviousDays:previous.intent.attemptId},recoveryEvidence:recoveryFile,operator:'fixture-authority',reference:'fixture-only',issuedAt:new Date().toISOString()};
  return {grant,request};
 }
+async function interruptedDiscardFixture(){
+ const version=`discard-queue-${sequence}/v1`,signal=new AbortController().signal;
+ const previous=await prepared(`${version}-previous`,'ReadDataPreviousDays');await reviewServiceContract(root,previous.loaded,previous.review);
+ await deliverServiceCapture(root,previous.loaded,previous.intent,previous.review,pools,signal);
+ const prior=await prepared(version,'ReadDataCurrentDay',130);await reviewServiceContract(root,prior.loaded,prior.review);
+ const base=join(root,'discard-control');await mkdir(base,{mode:0o700});
+ const options={base,root,configFile:join(root,'config.json'),intervalMs:120000,queueMaxCaptures:3};
+ const pending=async(p:typeof prior)=>writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:p.intent.attemptId,workDir:root,configurationDigest:p.loaded.configurationDigest}),{mode:0o600});
+ await pending(prior);
+ const first=createServiceCaptureQueue(options,pools,prior.loaded,()=>{});await first.initialize(signal);await first.step(signal);
+ const batch=(await pools.ingest.query('SELECT b.* FROM olos_export.batches b JOIN olos_export.runs r ON r.id=b.run_id WHERE r.contract_version=$1',[version])).rows[0];
+ expect((await pools.project.query("SELECT count(*)::int n FROM olos_export.projection_outbox WHERE batch_id=$1 AND state='confirmed'",[batch.id])).rows[0].n).toBe(64);
+ const interrupted=await prepared(version,'ReadDataCurrentDay',7);interrupted.intent={...interrupted.intent,contractReviewDigest:digest(prior.review)};
+ await writeFile(join(root,`attempt-${interrupted.intent.attemptId}.json`),JSON.stringify(interrupted.intent),{mode:0o600});await pending(interrupted);
+ const queue=createServiceCaptureQueue(options,pools,prior.loaded,()=>{});await queue.initialize(signal);
+ const failure=vi.spyOn(PostgresLargeBatchPersistence.prototype,'persist').mockRejectedValueOnce(new PersistenceError('LEASE_LOST'));
+ await expect(queue.step(signal)).rejects.toMatchObject({code:'LEASE_LOST'});failure.mockRestore();
+ const spool=await LocalSpool.open(join(root,'cases',interrupted.intent.attemptId,'import'),spoolLimits()),m=(await spool.active())!;
+ expect(m.identity.expected.version).toBe('1');expect(m.identity.streamId).toBe(batch.stream_id);
+ await fixture.admin.query("UPDATE olos_export.source_locks SET lease_until=clock_timestamp()-interval '1 second' WHERE owner_run_id=$1",[m.identity.runId]);
+ const [caseId]=await new PostgresPersistence(pools.ingest).recoverExpired();
+ const generation=(await pools.ingest.query("SELECT generation FROM olos_export.source_locks WHERE source_table='AttemptsRawData'")).rows[0].generation;
+ const approval={version:'olos-administrative-capture-discard/v1',authorizationId:randomUUID(),captureId:interrupted.intent.attemptId,batchId:m.identity.batchId,runId:m.identity.runId,streamId:m.identity.streamId,recoveryCaseId:caseId,manifestDigest:manifestDigest(m),expectedGeneration:generation,operatorReference:'TEST-DISCARD',reason:'OPERATOR_DECLINED_HISTORICAL_IMPORT',authorizedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+3500000).toISOString(),decision:'AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD',remoteReplayAllowed:false};
+ return {prior,previous,interrupted,batch,options,signal,m,approval,spool};
+}
+it('discarded capture stays out of the queue while prior deliveries and recurring acquisition continue after restart',async()=>{
+ const f=await interruptedDiscardFixture(),{options,signal,prior,previous,approval,m}=f;
+ const original=await readFile(join(f.spool.root,'batches',m.identity.batchId,'manifest.json'),'utf8');
+ await discardServiceCapture(options,prior.loaded,pools,approval,signal,()=>{});
+ const {grant,request}=await activationRequest(prior,previous);
+ await promoteService(root,prior.loaded,grant as never,request,{options,pools,signal,guard:()=>{}});
+ let captures=0;
+ const synthetic:typeof observeServiceCapture=async(base,_root,_loaded,_approval,guard,procedure,_signal,review)=>{
+  guard();captures++;const p=await prepared(review!.plan.contract.version,procedure),createdAt=`${captureDate}T12:00:00.000Z`;
+  const plan=planForCapture(review!,new Date(createdAt));p.intent={...p.intent,createdAt,plan,controlDate:plan.run.exportDate,contractReviewDigest:digest(review)};
+  await writeFile(join(root,`attempt-${p.intent.attemptId}.json`),JSON.stringify(p.intent),{mode:0o600});
+  await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:p.intent.attemptId,workDir:root,configurationDigest:p.loaded.configurationDigest}),{mode:0o600});return p.intent;
+ };
+ const materialize=vi.spyOn(PostgresLargeBatchPersistence.prototype,'persist');
+ const queue=createServiceCaptureQueue(options,pools,prior.loaded,()=>{},synthetic);await queue.initialize(signal);
+ expect(queue.snapshot().administrativelyDiscarded).toBe(1);expect(queue.snapshot().captureQueue.pending).toBe(1);
+ const proof=(await pools.ingest.query('SELECT proof_digest FROM olos_export.administrative_capture_discards WHERE capture_id=$1',[approval.captureId])).rows[0].proof_digest;
+ await fixture.admin.query("UPDATE olos_export.administrative_capture_discards SET proof_digest=repeat('0',64) WHERE capture_id=$1",[approval.captureId]);
+ await expect(createServiceCaptureQueue(options,pools,prior.loaded,()=>{},synthetic).initialize(signal)).rejects.toThrow();
+ await fixture.admin.query('UPDATE olos_export.administrative_capture_discards SET proof_digest=$2 WHERE capture_id=$1',[approval.captureId,proof]);
+ // Exercise the actual 120000 ms scheduler without running the delivery consumer.
+ const completions:Array<{acquisitionPerformed?:boolean}>=[];let completed!:()=>void;
+ const runner=new AttemptsCycleRunner(async s=>{completions.push(await queue.acquire(s));completed();},120000);
+ vi.useFakeTimers({toFake:['setTimeout','clearTimeout']});
+ try{
+  runner.start();await vi.advanceTimersByTimeAsync(119999);expect(captures).toBe(0);
+  for(let n=0;n<3;n++){
+   const done=new Promise<void>(resolve=>{completed=resolve;});
+   await vi.advanceTimersByTimeAsync(n===0?1:120000);await done;
+   for(let k=0;k<10 && !runner.nextExecutionAt;k++)await Promise.resolve();
+   expect(runner.status).toBe('running');
+  }
+ }finally{await runner.stop();vi.useRealTimers();}
+ expect(completions.map(c=>c.acquisitionPerformed)).toEqual([true,true,false]);expect(captures).toBe(2);
+ expect(queue.snapshot().captureQueue.admission?.reason).toBe('CAPTURE_QUEUE_COUNT_LIMIT');
+ expect(queue.snapshot().captureQueue.admission!.retainedBytes).toBeGreaterThan(m.bytes);
+ await queue.step(signal);await queue.step(signal);
+ expect(materialize.mock.calls.every(([manifest])=>manifest.identity.batchId!==m.identity.batchId)).toBe(true);
+ const batches=(await pools.ingest.query('SELECT id,expected_version FROM olos_export.batches WHERE stream_id=$1 ORDER BY expected_version',[m.identity.streamId])).rows;
+ expect(batches.map(b=>b.expected_version)).toEqual(['0','1']);expect(batches.some(b=>b.id===m.identity.batchId)).toBe(false);
+ expect((await pools.ingest.query('SELECT version FROM olos_export.checkpoints WHERE stream_id=$1',[m.identity.streamId])).rows[0].version).toBe('0');
+ const restart=createServiceCaptureQueue(options,pools,prior.loaded,()=>{},synthetic);await restart.initialize(signal);
+ expect(restart.snapshot().administrativelyDiscarded).toBe(1);
+ for(let n=0;n<5 && restart.snapshot().captureQueue.pending;n++)await restart.step(signal);
+ expect(restart.snapshot().captureQueue.pending).toBe(0);expect(await restart.step(signal)).toBe(false);
+ expect((await pools.ingest.query('SELECT version FROM olos_export.checkpoints WHERE stream_id=$1',[m.identity.streamId])).rows[0].version).toBe('2');
+ expect(await readFile(join(f.spool.root,'batches',m.identity.batchId,'manifest.json'),'utf8')).toBe(original);
+ expect(existsSync(join(root,'cases',approval.captureId,'delivered.json'))).toBe(false);
+ expect(materialize.mock.calls.every(([manifest])=>manifest.identity.batchId!==m.identity.batchId)).toBe(true);
+},30000);
+it('commit before queue handoff restarts through the durable V2 archive without a delivery ACK',async()=>{
+ const f=await interruptedDiscardFixture(),dir=join(root,'cases',f.approval.captureId),fs=await import('node:fs/promises');
+ // Synthetic crash boundary: queued entry is durable, remote-pending rename has not completed.
+ await fs.rename(join(dir,'remote-pending.captured.json'),join(f.options.base,'remote-pending.json'));
+ await discardServiceCapture(f.options,f.prior.loaded,pools,f.approval,f.signal,()=>{});
+ expect(existsSync(join(f.options.base,'remote-pending.json'))).toBe(true);
+ const saved=await readFile(join(dir,'queued.json'),'utf8');
+ const queue=createServiceCaptureQueue(f.options,pools,f.prior.loaded,()=>{});await queue.initialize(f.signal);
+ expect(existsSync(join(f.options.base,'remote-pending.json'))).toBe(false);
+ expect(await readFile(join(dir,'queued.json'),'utf8')).toBe(saved);
+ expect(existsSync(join(dir,'delivered.json'))).toBe(false);
+ const restart=createServiceCaptureQueue(f.options,pools,f.prior.loaded,()=>{});await restart.initialize(f.signal);
+ for(let n=0;n<5 && restart.snapshot().captureQueue.pending;n++)await restart.step(f.signal);
+ expect(restart.snapshot().captureQueue.pending).toBe(0);expect(restart.snapshot().administrativelyDiscarded).toBe(1);
+},30000);
+it.each(['missing','corrupt','digest','different-content'])('discard rejects inconsistent local artifacts: %s',async kind=>{
+ const f=await interruptedDiscardFixture(),file=join(f.spool.root,'batches',f.m.identity.batchId,['corrupt','different-content'].includes(kind)?'records.ready':'manifest.json');
+ const original=await readFile(file),manifestFile=join(f.spool.root,'batches',f.m.identity.batchId,'manifest.json'),originalManifest=await readFile(manifestFile);
+ let approval=f.approval;
+ if(kind==='different-content'){
+  const lines=original.toString().trimEnd().split('\n'),record=JSON.parse(lines[0]!);record.CampaignData='changed-synthetic';lines[0]=JSON.stringify(record);
+  const changed=Buffer.from(lines.join('\n')+'\n'),altered={...f.m,bytes:changed.length,sha256:createHash('sha256').update(changed).digest('hex')};
+  await writeFile(file,changed);await writeFile(manifestFile,JSON.stringify(altered));approval={...approval,manifestDigest:manifestDigest(altered)};
+ }
+ if(kind==='missing')await import('node:fs/promises').then(fs=>fs.rename(file,file+'.preserved'));
+ if(kind==='corrupt'){const damaged=Buffer.from(original);damaged[0]=0;await writeFile(file,damaged);}
+ try{await expect(discardServiceCapture(f.options,f.prior.loaded,pools,kind==='digest'?{...approval,manifestDigest:'0'.repeat(64)}:approval,f.signal,()=>{})).rejects.toThrow();}
+ finally{if(kind==='missing')await import('node:fs/promises').then(fs=>fs.rename(file+'.preserved',file));else await writeFile(file,original);await writeFile(manifestFile,originalManifest);}
+ // Close the isolated fixture with the valid administrative operation, leaving later test streams independent.
+ await discardServiceCapture(f.options,f.prior.loaded,pools,f.approval,f.signal,()=>{});
+ const queue=createServiceCaptureQueue(f.options,pools,f.prior.loaded,()=>{});await queue.initialize(f.signal);
+ for(let n=0;n<5 && queue.snapshot().captureQueue.pending;n++)await queue.step(f.signal);
+},30000);
 it('explicit ingestion reconciliation preserves the capture and resumes V2 delivery without any RPC',async()=>{
  const p=await prepared('service-explicit-local-reconciliation/v1','ReadDataCurrentDay',130);
  await reviewServiceContract(root,p.loaded,p.review);

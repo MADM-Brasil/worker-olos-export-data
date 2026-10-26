@@ -1,8 +1,12 @@
+import {
+  discardAdministrativeCapture,
+  administrativeCaptureDiscardSchema,assertAdministrativeDiscard
+} from '../src/persistence/administrative-capture-discard.js';
 import {localReconciliationApprovalSchema,reconcileLocalIngestion} from '../src/persistence/local-ingestion-reconciliation.js';
 import {mkdir,readdir,lstat,open,rename} from 'node:fs/promises';
 import {constants,openSync,readFileSync,fstatSync,closeSync,existsSync,realpathSync} from 'node:fs';
 import {join,dirname} from 'node:path';
-import {randomUUID} from 'node:crypto';
+import {randomUUID,createHash} from 'node:crypto';
 import {z} from 'zod';
 import type {PoolClient} from 'pg';
 import {privateDirectory,privateJson,durableExclusive} from './disposition-integration.js';
@@ -308,7 +312,8 @@ export async function operationalServiceStatus(options:ServiceOptions){
   for(const id of await readdir(join(root,'cases'))){if(!z.string().uuid().safeParse(id).success)continue;
    if(await serviceExists(join(root,'cases',id,'queued.json'))){queuedCaptureSchema.parse(await privateJson(join(root,'cases',id,'queued.json')));queued++;
     if(await serviceExists(join(root,'cases',id,'delivered.json')))delivered++;}}
-  result.captureQueue={queued,delivered,pending:queued-delivered};
+  // Files alone cannot distinguish a confirmed administrative discard from pending delivery.
+  result.captureQueue={queued,delivered,withoutDeliveryFile:queued-delivered,pending:null,scope:'FILES_ONLY_POSTGRES_NOT_PROBED'};
  }
  result.historicalInspection=await historicalInspectionStatus(base);
  if(await serviceExists(join(root,'cycles'))){const names=(await readdir(join(root,'cycles'))).filter(n=>/^\d+-[a-f0-9-]+\.json$/.test(n)).sort();
@@ -421,7 +426,7 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
  const {root,base}=options,limits=queueLimitsSchema.parse({maxCaptures:options.queueMaxCaptures,maxBytes:options.queueMaxBytes});
  type Item={entry:QueuedCapture;intent:Intent;review:ContractReview;context?:Awaited<ReturnType<typeof captureDelivery>>;manifest?:SpoolManifest;done:boolean;retryAt?:number;deferrals?:number};
  const items:Item[]=[],fair=new FairCaptureDelivery();
- let initialized=false,acquiring=false,delivering=false,failed=false,last:Intent|undefined,ordinal=0;
+ let initialized=false,acquiring=false,delivering=false,failed=false,last:Intent|undefined,ordinal=0,discardedCount=0;
  let lastImportConfirmedAt:string|null=null,lastError:string|null=null;
  let queueFailure:ReturnType<typeof logWorkerFailure>|null=null,lastDeferred:ReturnType<typeof logWorkerFailure>|null=null;
  let admission:Awaited<ReturnType<typeof captureAdmission>>|null=null;
@@ -431,12 +436,15 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
   if(!failed){lastError=queueError(error);if(!signal.aborted)queueFailure=logWorkerFailure('worker_flow_failed',error,context);}
   failed=true;return error;
  }
+ async function assertNoOpenRecovery(){
+  if((await pools.ingest.query("SELECT 1 FROM olos_export.recovery_cases c JOIN olos_export.runs r ON r.id=c.run_id WHERE r.source_table='AttemptsRawData' AND c.state='open' LIMIT 1")).rowCount)throw Error('RECOVERY_REQUIRED');
+ }
  async function reviewed(intent:Intent){
   const review=contractReviewSchema.parse(await privateJson(join(root,'reviews',`${intent.procedure}.json`)));
   if(review.configurationDigest!==loaded.configurationDigest)throw Error('OBSERVED_CONTRACT_NOT_APPROVED');
   return review;
  }
- async function enqueue(intent:Intent,review:ContractReview){
+ async function enqueue(intent:Intent,review:ContractReview,discarded=false){
   const {response}=await captureInfo(root,intent.attemptId),dir=join(root,'cases',intent.attemptId);
   const metadata=await privateJson(join(dir,'capture','batches',intent.attemptId,'response.json')) as {rawMessageComplete?:boolean};
   if(metadata.rawMessageComplete!==true || intent.workDir!==root || intent.configurationDigest!==loaded.configurationDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
@@ -450,7 +458,7 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
   const entry:QueuedCapture={kind:'olos-capture-queue/v1',captureId:intent.attemptId,ordinal:existing?.ordinal??ordinal+1,
    captureSha256:response.sha256,intentDigest:digest(intent),reviewDigest:digest(review),configurationDigest:loaded.configurationDigest,pendingDigest:digest(marker)};
   await handoffCapture(base,root,entry);ordinal=Math.max(ordinal,entry.ordinal);
-  items.push({entry,intent,review,done:false});last=intent;return response.received;
+  if(!discarded)items.push({entry,intent,review,done:false});last=intent;return response.received;
  }
  async function context(item:Item){return item.context??=await captureDelivery(root,loaded,item.intent,item.review,pools,true);}
  async function materialize(item:Item,signal:AbortSignal){
@@ -475,7 +483,7 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
  }
  return {
   snapshot:()=>({captureQueue:{pending:items.filter(i=>!i.done).length,materialized:items.filter(i=>!i.done && i.manifest).length,limits,admission},deliveryInFlight:delivering,
-   lastDurableCaptureId:last?.attemptId??null,lastProcedure:last?.procedure??null,lastImportConfirmedAt,lastError,queueFailure,lastDeferred,
+   lastDurableCaptureId:last?.attemptId??null,lastProcedure:last?.procedure??null,lastImportConfirmedAt,lastError,queueFailure,lastDeferred,administrativelyDiscarded:discardedCount,
    deferredDeliveries:items.filter(i=>!i.done && (i.retryAt??0)>Date.now()).length}),
   async initialize(signal:AbortSignal,bootstrapReviews:readonly ContractReview[]=[]){
    let diagnostic:FailureContext={flow:'initialization',stage:'INITIALIZE'};
@@ -485,6 +493,10 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
     const intent=captureIntentSchema.parse(await privateJson(join(root,n)));
     if(n!==`attempt-${intent.attemptId}.json` || intent.workDir!==root || intent.configurationDigest!==loaded.configurationDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');return intent;
    }));
+   // Old installations without 008 retain the old fail-closed behavior for uncertain captures.
+   const hasDiscardLedger=(await pools.ingest.query("SELECT to_regclass('olos_export.administrative_capture_discards') AS table_name")).rows[0].table_name;
+   const discardedIds=new Set<string>(hasDiscardLedger?(await pools.ingest.query("SELECT capture_id FROM olos_export.administrative_capture_discards WHERE configuration_digest=$1 OR capture_id=ANY($2::uuid[])",[loaded.configurationDigest,intents.map(i=>i.attemptId)])).rows.map(r=>r.capture_id as string):[]);
+   if([...discardedIds].some(id=>!intents.some(i=>i.attemptId===id)))throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
    const pending=await pendingServiceCase(base,root);
    const positions=new Map<string,number>(),seen=new Set<number>();
    for(const intent of intents){const file=join(root,'cases',intent.attemptId,'queued.json');if(await serviceExists(file)){
@@ -497,13 +509,27 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
    for(const intent of intents){
     diagnostic={flow:'initialization',stage:'VALIDATE_BATCH',captureId:intent.attemptId};
     check(signal);const dir=join(root,'cases',intent.attemptId);
-    if(await serviceExists(join(dir,'not-dispatched-closed.json')))continue;
+    if(await serviceExists(join(dir,'not-dispatched-closed.json'))){if(discardedIds.has(intent.attemptId))throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');continue;}
     const review=await reviewed(intent);
     const caseManifests:SpoolManifest[]=[];
     if(await serviceExists(join(dir,'import','batches')))for(const id of await readdir(join(dir,'import','batches'))){
      const m=await privateJson(join(dir,'import','batches',id,'manifest.json')) as SpoolManifest;
      caseManifests.push(m);
      knownBatches.push(m.identity.batchId);knownRuns.push(m.identity.runId);
+    }
+    if(discardedIds.has(intent.attemptId)){
+     const {manifest,local}=await discardCaptureEvidence(root,loaded,pools,intent.attemptId,signal);
+     await assertAdministrativeDiscard(pools.ingest,manifest,local);check(signal);
+     if(pending?.attemptId===intent.attemptId)await enqueue(intent,review,true);
+     else{
+      const entry=queuedCaptureSchema.parse(await privateJson(join(dir,'queued.json')));
+      const marker=await privateJson(join(dir,'remote-pending.captured.json')) as {attemptId?:string;workDir?:string;configurationDigest?:string};
+      if(entry.ordinal<=ordinal || entry.captureId!==intent.attemptId || entry.intentDigest!==local.intentDigest || entry.reviewDigest!==local.reviewDigest ||
+       entry.captureSha256!==local.captureSha256 || entry.configurationDigest!==loaded.configurationDigest || entry.pendingDigest!==digest(marker) ||
+       marker.attemptId!==intent.attemptId || marker.workDir!==root || marker.configurationDigest!==loaded.configurationDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+      ordinal=entry.ordinal;last=intent;
+     }
+     discardedCount++;continue;
     }
     if(await serviceExists(join(dir,'delivered.json'))){
      const {response}=await captureInfo(root,intent.attemptId),ack=await privateJson(join(dir,'delivered.json')) as {captureSha256:string;reviewDigest:string;batchId:string;confirmedAt:string};
@@ -535,6 +561,7 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
    }
    diagnostic={flow:'initialization',stage:'INITIALIZE'};
    if(await pendingServiceCase(base,root))throw Error('RECOVERY_REQUIRED');
+   await assertNoOpenRecovery();
    if((await pools.ingest.query("SELECT 1 FROM olos_export.runs WHERE source_table='AttemptsRawData' AND state IN ('read_intent','persisting','needs_reconciliation') AND NOT(id=ANY($1::uuid[])) LIMIT 1",[knownRuns])).rowCount ||
     (await pools.project.query("SELECT 1 FROM olos_export.projection_outbox WHERE state<>'confirmed' AND NOT(batch_id=ANY($1::uuid[])) LIMIT 1",[knownBatches])).rowCount)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
    const mode={kind:'olos-independent-delivery/v1',configurationDigest:loaded.configurationDigest};
@@ -566,7 +593,7 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
     stage='ADMISSION';admission=await captureAdmission(root,items.filter(i=>!i.done).length,items.filter(i=>!i.done && !i.manifest).length,limits,spoolLimits().maxDiskBytes,spoolLimits().minFreeBytes);
     if(!admission.allowed)return {received:0,persisted:0,duplicates:0,rejected:0,acquisitionPerformed:false};
     const procedure=last?.procedure==='ReadDataCurrentDay'?'ReadDataPreviousDays':'ReadDataCurrentDay',review=reviews.find(r=>r.procedure===procedure)!;
-    stage='PREFLIGHT';await new PostgresLargeBatchPersistence(pools.ingest,spoolLimits(),300000).preflight(planForCapture(review));activeGuard();stage='CAPTURE';
+    stage='PREFLIGHT';await assertNoOpenRecovery();await new PostgresLargeBatchPersistence(pools.ingest,spoolLimits(),300000).preflight(planForCapture(review));activeGuard();stage='CAPTURE';
     const intent=await capture(base,root,loaded,authorized.approval,activeGuard,procedure,signal,review);
     captureId=intent.attemptId;stage='HANDOFF';const received=await enqueue(intent,review);
     return {received,persisted:0,duplicates:0,rejected:0,acquisitionPerformed:true};
@@ -617,6 +644,52 @@ function queueError(error:unknown){
  return failureDetails(error).code;
 }
 /** Explicit operator-authorized, local-only ingestion reconciliation. No source factory is invoked. */
+/**
+ * Descarte administrativo de uma captura local já interrompida.
+ * Não consulta a Olos, não materializa registros e não altera checkpoints.
+ */
+/** Read and exhaust the original private artifacts; never starts a source or a materialization. */
+async function discardCaptureEvidence(root:string,loaded:Loaded,pools:RuntimePools,captureId:string,signal:AbortSignal){
+ const {intent,response,spool:capture}=await captureInfo(root,captureId);
+ const review=contractReviewSchema.parse(await privateJson(join(root,'reviews',`${intent.procedure}.json`)));
+ const ctx=await captureDelivery(root,loaded,intent,review,pools,true);
+ const batches=await readdir(join(ctx.dir,'import','batches'));
+ if(batches.length!==1 || await serviceExists(ctx.done) || intent.workDir!==root || review.configurationDigest!==loaded.configurationDigest)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+ const m=await privateJson(join(ctx.dir,'import','batches',batches[0]!,'manifest.json')) as SpoolManifest;
+ const started=await privateJson(ctx.started),active=await ctx.spool.active();
+ const metadata=await privateJson(join(ctx.dir,'capture','batches',captureId,'response.json')) as {rawMessageComplete?:boolean};
+ if(!active || canonical(active)!==canonical(m) || m.identity.batchId!==batches[0] || !m.sealed || m.state!=='uncertain' || metadata.rawMessageComplete!==true ||
+  digest(started)!==digest({attemptId:captureId,reviewDigest:digest(review),captureSha256:response.sha256}) ||
+  m.rows!==response.received || canonical(m.identity.plan)!==canonical(ctx.plan))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+ for await(const _ of ctx.spool.records(m)){if(signal.aborted)throw Error('STOPPED');}
+ // Bind the decoded spool to THIS original TDS response, not merely to equal row counts/plan.
+ const replay=replayTdsResponse(review.fields,()=>capture.responseChunks(captureId),response.received),hash=createHash('sha256');
+ const maxRecordBytes=spoolLimits().maxRecordBytes;
+ let rows=0,bytes=0,complete=false;
+ for await(const event of replay.read(ctx.plan,signal)){
+  if(signal.aborted || complete)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+  if(event.kind==='row'){
+   const line=JSON.stringify(decodeWireRow(ctx.plan,event.values,maxRecordBytes))+'\n';
+   hash.update(line);bytes+=Buffer.byteLength(line);rows++;
+  }else{
+   if(event.datasetCount!==1 || event.errorMessage!==null && event.errorMessage!=='' || !ctx.plan.successReturnValues.includes(event.returnValue))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+   complete=true;
+  }
+ }
+ if(!complete || rows!==m.rows || bytes!==m.bytes || hash.digest('hex')!==m.sha256)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+ return {manifest:m,local:{captureId,configurationDigest:loaded.configurationDigest,captureSha256:response.sha256,
+  intentDigest:digest(intent),reviewDigest:digest(review),importStartedDigest:digest(started)}};
+}
+export async function discardServiceCapture(options:ServiceOptions,loaded:Loaded,pools:RuntimePools,input:unknown,signal:AbortSignal,guard:()=>void){
+ const approval=administrativeCaptureDiscardSchema.parse(input);
+ try{
+  guard();const {manifest,local}=await discardCaptureEvidence(options.root,loaded,pools,approval.captureId,signal);guard();
+  const result=await discardAdministrativeCapture(pools.ingest,manifest,approval,signal,local);
+  return {event:'administrative_capture_discarded',...result,acquisitionPerformed:false,schedulerStarted:false,retryRemote:false};
+ }catch(error){const context:FailureContext={flow:'initialization',stage:'RECONCILE',captureId:approval.captureId,batchId:approval.batchId,streamId:approval.streamId};
+  logWorkerFailure('worker_flow_failed',error,context);throw annotateFailure(error,context);}
+}
+
 export async function reconcileServiceIngestion(options:ServiceOptions,loaded:Loaded,pools:RuntimePools,input:unknown,signal:AbortSignal,guard:()=>void){
  const a=localReconciliationApprovalSchema.parse(input);
  let stage:FailureContext['stage']='VALIDATE_BATCH';try{
@@ -666,6 +739,19 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
   const result=await deliverServiceCapture(options.root,loaded,pending,review,pools,signal);await finishServiceCase(options.base,options.root,pending);return {...result,state:'BOOTSTRAP'};
  },true);
  if(action==='reconcile-ingestion')return withLocalLock(options,async(pools,signal)=>reconcileServiceIngestion(options,loaded,pools,await privateJson(flags['--reconciliation-file']!),signal,guard),true);
+ if(action==='discard-capture')return withLocalLock(
+  options,
+  async(pools,signal)=>discardServiceCapture(
+    options,
+    loaded,
+    pools,
+    await privateJson(flags['--discard-file']!),
+    signal,
+    guard
+  ),
+  true
+);
+
  if(action==='recover-queue')return withLocalLock(options,async(pools,signal)=>{
   const queue=createServiceCaptureQueue(options,pools,loaded,guard);await queue.initialize(signal);
   while((queue.snapshot().captureQueue.pending)>0){if(!await queue.step(signal))throw Error('DELIVERY_REQUIRES_RECONCILIATION');}

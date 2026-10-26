@@ -1179,3 +1179,261 @@ o serviço principal está configurado para iniciar aquisição automaticamente.
 - Bancos descartáveis PostgreSQL 16; sem conexão à produção, RPC real, commit,
   push ou deploy. A carga local não representa benchmark da VPS nem determina
   a causa temporal específica da expiração de produção.
+
+## Descarte administrativo de captura histórica interrompida
+
+`discard-capture` implementa uma decisão operacional explícita de **não importar**
+uma captura histórica. Não é tratamento automático de erro, recuperação de dados
+nem confirmação de entrega. O caso de referência é a captura
+`96581d83-880e-42e4-b9c9-a49800cf45ab`, lote
+`9860ee42-4f1d-44d1-b8e2-110d26e39da3`, run
+`8b9200fa-2a9f-4b12-bd52-ff4fae43a8f8`, stream
+`839251d4-a8e9-4fd7-b5c1-a158c11d581a` e recovery case
+`555d39b2-592e-4174-9e14-dff3f61ab79e`.
+
+O bloqueio do scheduler é coerente com a proteção existente: `initialize()`
+encontra `import-started.json` e o manifesto `uncertain`, tenta recuperar a
+materialização e encontra o fencing token revogado. Um caso aberto também impede
+novas execuções de ingestão. A presença de um lote anterior confirmado, com
+entregas pendentes, não resolve a incerteza do segundo lote. O descarte registra
+uma decisão separada e terminal para esse segundo lote; não altera o primeiro.
+
+### Protocolo e garantias
+
+- A CLI exige `--confirm AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD` e um JSON
+  privado, válido por até uma hora. A autorização vincula CaptureId, BatchId,
+  RunId, StreamId, RecoveryCaseId, digest do manifesto e geração esperada.
+- Antes de qualquer transição, valida captura TDS completa, TLS já observado,
+  revisão/configuração/intent, `import-started.json`, manifesto ativo selado
+  `uncertain` e o arquivo integral `records.ready` (bytes, quantidade e hash).
+  A resposta TDS local é decodificada novamente e seu conteúdo/hash é comparado
+  ao spool, recusando troca de conteúdo mesmo com hashes individuais recalculados.
+  O fluxo só lê arquivos e PostgreSQL; não instancia uma aquisição OLOS.
+- A mesma advisory lock da instância V2 impede administração concorrente com o
+  serviço. Dentro da transação, a row lock da origem com `NOWAIT` é a barreira
+  contra uma materialização ainda em andamento, inclusive uma transação preparada.
+  A geração deve ser exatamente a autorizada, maior que o token original, sem
+  proprietário ou lease. Não existe takeover nem renovação no descarte.
+- Run e recovery case são bloqueados e conferidos, incluindo identidade,
+  contrato, data/tipo de stream, PK range, contadores zero e motivo
+  `expired_read_intent`. Outros runs/casos pendentes incompatíveis bloqueiam.
+- Ausência de recibo sozinha não basta. São verificadas as raízes e dependências
+  do protocolo: batches pelo ID **e** pelo run, recibos, chaves, envelopes,
+  projeções/outbox, eventos, recibos de entrega vinculados, auditoria de escrita,
+  erros e execuções anteriores de reconciliação local. Um evento diagnóstico
+  `reconciliation_required` com contadores zero é permitido; efeitos/erros
+  desconhecidos e qualquer reconciliação de ingestão já iniciada são recusados.
+- O histórico confirmado do stream deve ser contíguo e compatível com recibos,
+  projeções e checkpoint. O ponto de ingestão real deve coincidir com a posição
+  esperada do manifesto interrompido. Entregas anteriores podem permanecer
+  pendentes. Nenhum checkpoint, fencing token ou recibo é escrito.
+- Uma transação insere autorização, manifesto original, hashes dos arquivos e
+  prova em `administrative_capture_discards`, muda o run para `failed` e resolve
+  o caso. O ledger é append-only para o worker, com unicidade por captura, lote,
+  run, caso e autorização. Não se escreve `succeeded`, recibo de importação ou ACK.
+- `COMMIT_UNKNOWN` não causa nova decisão automática. A repetição com a mesma
+  autorização confere ledger, hashes, identidades, run/caso e ausência de efeitos.
+  Uma decisão já confirmada pode ser reconhecida depois da expiração; uma nova
+  decisão exige autorização válida. Uma autorização alterada ou reutilizada para
+  outra captura é recusada. O comando não pode roubar a lock de um sucessor.
+
+A migration **008** acrescenta apenas o ledger e seu índice por configuração;
+não altera `schema_versions`, migrations anteriores, constraints de dados ou o
+protocolo de recibos. O índice permite revalidar os descartes do mesmo serviço sem
+confundir históricos de configurações diferentes. A migration 007 e suas
+permissões são pré-requisitos, pois descartes com reconciliação local já iniciada
+precisam ser recusados. Aplicação sempre manual por DBA.
+
+### Reconhecimento na fila e retomada
+
+`initialize()` consulta o ledger do serviço e rejeita registro sem intent local,
+prova divergente, arquivos ausentes, manifesto alterado, run/caso incoerente ou
+qualquer efeito no lote descartado. Depois da validação, ignora somente esse item:
+não chama `materializeLocal()`, não o inclui na lista de pendentes e não cria
+`delivered.json`. Preserva seu ordinal e a alternância histórica dos procedimentos.
+
+Se houver `remote-pending.json`, usa exclusivamente `handoffCapture()` já existente:
+registro durável `queued.json`, rename para `remote-pending.captured.json` e fsync.
+O registro de handoff preserva a posição histórica, mas não recoloca a captura
+na fila operacional. Crash entre commit e handoff é recuperável no próximo
+`initialize()`. O comando de descarte em si não altera arquivos ou marcadores.
+
+O próximo lote usa o fim da sequência de **lotes efetivamente committed**. No
+cenário de checkpoint 0, lote anterior na posição 0 e captura descartada esperando
+posição 1, a próxima ingestão usa posição 1. Não existe um lote fictício ocupando
+a lacuna. O checkpoint avança depois pelos ACKs reais, de forma contígua.
+
+`AttemptsService` mantém o agendador de `queue.acquire()` separado do laço de
+`queue.step()`, sob um único proprietário da advisory lock. O intervalo continua
+120000 ms após o término de cada ciclo; a primeira aquisição ocorre após esse
+intervalo. Não é preciso drenar todo o backlog para retomar. Recuperação aberta,
+falha não isolável ou inconsistência continua interrompendo o serviço; há checagem
+explícita de casos abertos antes da inicialização e da aquisição.
+
+Os arquivos descartados continuam consumindo espaço: `captureAdmission()` os
+inclui nos bytes retidos, mesmo sem ocuparem uma vaga de captura pendente. Limites
+de quantidade, reserva de espaço e espaço livre continuam ativos. Não há remoção
+ou política nova de retenção. `administrativelyDiscarded` no snapshot da fila
+informa o total reconhecido. O `service-status` que não consulta PostgreSQL expõe
+`pending=null`, `withoutDeliveryFile` e `scope=FILES_ONLY_POSTGRES_NOT_PROBED`;
+contar ausência de `delivered.json` como pendência seria incorreto após descarte.
+O status do runtime usa a fila validada no banco.
+
+### Publicação e ativação controlada no Dokploy — somente após autorização posterior
+
+Nada desta seção foi executado em produção. Revisar o diff e o relatório de testes,
+aprovar a release e, só então, publicar uma imagem com esta branch. Antes de
+substituir o worker, suspender redeploy/restart automático no Dokploy, parar o
+serviço coordenadamente e preservar backup consistente do banco e `worker_state`.
+Manter uma única instância e os mesmos volumes, usuário, configuração e work-dir.
+Não usar `up`/redeploy que execute `start` antes de concluir a janela administrativa.
+
+Com a imagem revisada disponível e o worker principal parado, no diretório Compose:
+
+```bash
+docker compose stop worker
+docker compose exec -T postgres psql -U olos_admin -d olos_worker -v ON_ERROR_STOP=1 \
+  < migrations/008_administrative_capture_discard.sql
+docker compose exec -T postgres psql -U olos_admin -d olos_worker -v ON_ERROR_STOP=1 \
+  < permissions/administrative-capture-discard.sql
+```
+
+Conferir previamente que 001–005 e 007/permissões estão instaladas; não reaplicar
+migrations existentes, nem contornar erro de tabela já criada. Verificar a situação
+atual com consultas somente leitura:
+
+```bash
+docker compose exec -T postgres psql -U olos_admin -d olos_worker -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN READ ONLY;
+SELECT r.id,r.stream_id,r.state,r.fencing_token,r.received_count,r.persisted_count,
+       r.duplicate_count,r.rejected_count,l.generation,l.owner_run_id,l.lease_until,
+       c.version,c.cursor_value,c.last_batch_id
+FROM olos_export.runs r JOIN olos_export.source_locks l USING(source_table)
+JOIN olos_export.checkpoints c USING(stream_id)
+WHERE r.id='8b9200fa-2a9f-4b12-bd52-ff4fae43a8f8';
+SELECT id,run_id,state,reason FROM olos_export.recovery_cases
+WHERE id='555d39b2-592e-4174-9e14-dff3f61ab79e';
+SELECT b.id,b.run_id,b.expected_version,b.state,x.manifest_digest,
+       count(o.delivery_id) FILTER(WHERE o.state<>'confirmed') AS pending
+FROM olos_export.batches b LEFT JOIN olos_export.large_batch_receipts x ON x.batch_id=b.id
+LEFT JOIN olos_export.projection_outbox o ON o.batch_id=b.id
+WHERE b.stream_id='839251d4-a8e9-4fd7-b5c1-a158c11d581a'
+GROUP BY b.id,x.manifest_digest ORDER BY b.expected_version;
+COMMIT;
+SQL
+```
+
+Confirmar geração 5, token original 4, ausência de proprietário/lease, caso aberto,
+contadores zero e o lote anterior preservado. Se o estado divergir, investigar;
+não mudar dados para ajustá-los a este procedimento. As consultas operacionais
+não substituem a prova transacional refeita pela CLI.
+
+Após aprovação humana explícita da não importação, criar uma autorização privada
+com os IDs reais e o digest calculado do manifesto preservado:
+
+```bash
+read -r -p 'Referência da aprovação do descarte: ' discard_reference
+docker compose run --rm --no-deps -T -e OLOS_DISCARD_REFERENCE="$discard_reference" \
+  --entrypoint node worker --input-type=module <<'JS'
+import {readFile,writeFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
+import {manifestDigest} from './dist/cli/src/persistence/large-batch.js';
+import {validateAdministrativeCaptureDiscard} from './dist/cli/src/persistence/administrative-capture-discard.js';
+const root='/home/node/.local/state/olos-worker/corporate-attempts/service-run';
+const captureId='96581d83-880e-42e4-b9c9-a49800cf45ab';
+const batchId='9860ee42-4f1d-44d1-b8e2-110d26e39da3';
+const runId='8b9200fa-2a9f-4b12-bd52-ff4fae43a8f8';
+const streamId='839251d4-a8e9-4fd7-b5c1-a158c11d581a';
+const m=JSON.parse(await readFile(`${root}/cases/${captureId}/import/batches/${batchId}/manifest.json`,'utf8'));
+if(!m.sealed || m.state!=='uncertain' || m.rows!==200000 || m.identity.batchId!==batchId ||
+   m.identity.runId!==runId || m.identity.streamId!==streamId || m.identity.fencingToken!=='4')throw Error('CASE_DIVERGED');
+const approval=validateAdministrativeCaptureDiscard({
+ version:'olos-administrative-capture-discard/v1',authorizationId:randomUUID(),captureId,batchId,runId,streamId,
+ recoveryCaseId:'555d39b2-592e-4174-9e14-dff3f61ab79e',manifestDigest:manifestDigest(m),expectedGeneration:'5',
+ operatorReference:process.env.OLOS_DISCARD_REFERENCE,reason:'OPERATOR_DECLINED_HISTORICAL_IMPORT',
+ authorizedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+3500000).toISOString(),
+ decision:'AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD',remoteReplayAllowed:false
+});
+const file=`${root}/discard-96581d83.json`;
+await writeFile(file,JSON.stringify(approval,null,2)+'\n',{flag:'wx',mode:0o600});
+console.log(JSON.stringify({authorizationFile:file,authorizationId:approval.authorizationId,manifestDigest:approval.manifestDigest}));
+JS
+
+docker compose run --rm --no-deps -T --entrypoint node worker \
+  dist/cli/adapters/attempts-corporate.js discard-capture \
+  --config /home/node/.config/olos-worker/attempts-service.json \
+  --work-dir /home/node/.local/state/olos-worker/corporate-attempts/service-run \
+  --discard-file /home/node/.local/state/olos-worker/corporate-attempts/service-run/discard-96581d83.json \
+  --confirm AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD
+```
+
+O arquivo usa criação exclusiva e não deve ser sobrescrito. Em perda do ACK,
+inspecionar o banco e repetir o comando com **o mesmo arquivo**; não criar outra
+autorização para encobrir `COMMIT_UNKNOWN`. Antes de retomar, conferir:
+
+```sql
+SELECT capture_id,batch_id,original_run_id,recovery_case_id,stream_id,
+       authorization_id,manifest_digest,expected_generation,discarded_at
+FROM olos_export.administrative_capture_discards
+WHERE capture_id='96581d83-880e-42e4-b9c9-a49800cf45ab';
+SELECT state,finished_at,received_count,persisted_count FROM olos_export.runs
+WHERE id='8b9200fa-2a9f-4b12-bd52-ff4fae43a8f8';
+SELECT state,resolved_at FROM olos_export.recovery_cases
+WHERE id='555d39b2-592e-4174-9e14-dff3f61ab79e';
+SELECT version,cursor_value,last_batch_id FROM olos_export.checkpoints
+WHERE stream_id='839251d4-a8e9-4fd7-b5c1-a158c11d581a';
+```
+
+Esperado: um descarte, run `failed` com contadores zero, caso `resolved`, checkpoint
+inalterado, nenhum batch/recibo criado para o lote descartado e todos os arquivos
+preservados. Não executar `reconcile-ingestion` para este caso após a decisão.
+
+Com aprovação de retomada, restaurar o comando principal do Compose/Dokploy
+`start --interval-ms 120000`, preservando os demais argumentos, e iniciar uma única
+instância. `initialize()` valida o descarte e arquiva eventual pending pelo handoff
+antes de armar o scheduler. A primeira RPC ocorrerá após 120 segundos; acompanhar
+snapshot, `administrativelyDiscarded`, backlog, logs e checkpoints. Não é necessário
+executar `recover-queue` até drenar o lote anterior. Esse comando continua disponível
+como recuperação **local** opcional, mas não substitui a autorização de descarte.
+
+### Limites operacionais
+
+Não há exclusão física nem mecanismo de desfazer descarte. Os registros históricos
+não importados continuam somente nas evidências locais; a decisão deve ser aceita
+pela operação. Recibos divergentes, efeitos desconhecidos, outra recuperação ou
+reconciliação de ingestão já iniciada continuam bloqueados. Alterações fora do
+protocolo por um administrador não são presumidas seguras. Configuração/revisões
+ou arquivos alterados exigem análise, não reescrita de provas. Versões anteriores
+sem reconhecimento deste ledger não são um rollback operacional compatível: tenderão
+a recusar o manifesto ainda `uncertain`. A revalidação integral dos arquivos no
+startup acrescenta I/O e processamento proporcionais ao tamanho das capturas.
+Não apagar o ledger nem arquivos para
+permitir downgrade. O espaço retido pode voltar a impedir aquisição pelas quotas.
+
+### Relatório final de validação do descarte
+
+Versão final, 26/10/2026:
+
+- `npm run typecheck`: aprovado.
+- `npm run build`: aprovado, incluindo a CLI compilada.
+- `npm test -- --maxWorkers=2 --testTimeout=60000`: **875 aprovados, 5 opcionais
+  ignorados**, 60 arquivos aprovados e 3 ignorados, 272,19 s.
+- `git diff --check`: aprovado.
+- 34 testes novos: 28 casos PostgreSQL de descarte e 6 casos integrados de fila,
+  arquivos e scheduler. Os novos testes não usam SQL DELETE/TRUNCATE: os bancos
+  são fixtures descartáveis. Os testes de fila impedem chamadas ao transporte OLOS.
+- Cobertura: lote anterior committed com entrega parcial, descarte sem avanço de
+  checkpoint, fencing antigo, identidade/digest/autorização/geração incorretos,
+  expiração, lease ativa, runs/casos concorrentes, efeitos/contadores/resultado
+  desconhecido, concorrência de descartes, barreira de lock da materialização,
+  rollback antes do commit, COMMIT_UNKNOWN, idempotência após expiração, prova
+  adulterada, arquivos ausentes/corrompidos e conteúdo diferente da resposta TDS
+  original mesmo com hashes individuais recalculados.
+- O teste integrado usa o scheduler real com relógio simulado: zero aquisição
+  antes de 120000 ms, ciclos independentes da entrega, limite de fila preservado,
+  próxima ingestão na posição correta, nenhum replay da captura descartada,
+  handoff durável e retomada após restart. O backlog anterior é entregue com os
+  recibos reais do receptor de teste, mantendo deduplicação e avanço contíguo.
+- Limite da evidência: fixtures locais PostgreSQL/TDS sintéticas; nenhum ensaio na
+  VPS ou validação de desempenho da infraestrutura de produção. Não houve commit,
+  push, merge, deploy, aplicação de migration real ou RPC OLOS real.
