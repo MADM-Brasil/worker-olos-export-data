@@ -18,6 +18,9 @@ import {digest} from '../src/persistence/validation.js';
 import {IsolatedTdsSource} from '../src/olos/tds/source.js';
 import {PostgresDeliveryTarget} from '../src/projection/postgres-target.js';
 import {ProjectionDispatcher} from '../src/projection/dispatcher.js';
+import {ProjectionOutbox} from '../src/projection/outbox.js';
+import {PersistenceError} from '../src/persistence/types.js';
+import {preserveFailure} from '../src/diagnostics/worker-failure.js';
 import {PostgresLargeBatchPersistence} from '../src/persistence/large-batch.js';
 import {InspectionDiagnostics} from '../src/olos/tds/inspection-diagnostics.js';
 let fixture:Awaited<ReturnType<typeof isolatedPostgres>>,root:string,captureDate:string,sequence=0;
@@ -207,7 +210,7 @@ it.each(['partial','digest'])('queue refuses %s capture evidence without archivi
  await expect(queue.acquire(new AbortController().signal)).rejects.toThrow('CAPTURE_QUEUE_REQUIRES_REVIEW');
 });
 
-it.each(['none','migration','checkpoint-before','checkpoint-after'])('activates with a partially delivered bootstrap and survives %s failure without reingestion',async failure=>{
+it.each(['none','migration','checkpoint-before','checkpoint-after','claim-contention'])('activates with a partially delivered bootstrap and survives %s failure without reingestion',async failure=>{
  const signal=new AbortController().signal,current=await prepared(`bootstrap-current-${failure}/v1`);
  await reviewServiceContract(root,current.loaded,current.review);
  await deliverServiceCapture(root,current.loaded,current.intent,current.review,pools,signal);
@@ -246,6 +249,12 @@ it.each(['none','migration','checkpoint-before','checkpoint-after'])('activates 
  };
  const synthetic=vi.fn(capture),queue=createServiceCaptureQueue(options,pools,current.loaded,()=>{},synthetic);
  await queue.initialize(signal);
+ if(failure==='claim-contention'){
+  const busy=vi.spyOn(ProjectionOutbox.prototype,'claimBatch').mockRejectedValueOnce(preserveFailure(new PersistenceError('BUSY'),{code:'55P03'}));
+  expect(await queue.step(signal)).toBe(false);busy.mockRestore();
+  expect(queue.snapshot()).toMatchObject({lastError:null,queueFailure:null,deferredDeliveries:1,lastDeferred:{flow:'delivery',stage:'CLAIM',captureId:previous.intent.attemptId,batchId:batch.id,technicalCode:'55P03'}});
+  expect(await snapshot()).toEqual(before);expect(await checkpoint()).toBe('0');
+ }
  // assertActive accepts the persisted activation while the original 66 deliveries remain pending.
  expect((await queue.acquire(signal)).acquisitionPerformed).toBe(true);expect(synthetic).toHaveBeenCalledOnce();expect(await snapshot()).toEqual(before);
  let restarted=createServiceCaptureQueue(options,pools,current.loaded,()=>{});await restarted.initialize(signal);
@@ -311,6 +320,22 @@ it.each(['unpersisted','receipt','rows','position','uncertain'])('rejects bootst
  await expect(blocked.acquire(signal)).rejects.toThrow('CAPTURE_QUEUE_REQUIRES_REVIEW');expect(synthetic).not.toHaveBeenCalled();
  await restore();const recovery=createServiceCaptureQueue(options,pools,current.loaded,()=>{});await recovery.initialize(signal);while(recovery.snapshot().captureQueue.pending)await recovery.step(signal);
 },30000);
+
+it('claim contention has bounded deferrals, never retries unknown errors, and restarts with the same batch',async()=>{
+ const p=await queuedFixture('queued-claim-contention/v1'),signal=new AbortController().signal;
+ const queue=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await queue.initialize(signal);
+ const busy=vi.spyOn(ProjectionOutbox.prototype,'claimBatch').mockImplementation(async()=>{throw preserveFailure(new PersistenceError('BUSY'),{code:'55P03'});});
+ let now=Date.now();const clock=vi.spyOn(Date,'now').mockImplementation(()=>now);
+ try{
+  for(let n=0;n<3;n++){expect(await queue.step(signal)).toBe(false);expect(queue.snapshot().queueFailure).toBeNull();now+=31000;}
+  await expect(queue.step(signal)).rejects.toMatchObject({code:'BUSY'});
+  expect(queue.snapshot().queueFailure).toMatchObject({flow:'delivery',stage:'CLAIM',captureId:p.intent.attemptId,technicalCode:'55P03'});
+  await expect(queue.acquire(signal)).rejects.toThrow('RECOVERY_REQUIRED');
+ }finally{busy.mockRestore();clock.mockRestore();}
+ const before=(await fixture.admin.query('SELECT id FROM olos_export.batches WHERE run_id IN (SELECT id FROM olos_export.runs WHERE contract_version=$1)',[p.review.plan.contract.version])).rows;
+ const restarted=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await restarted.initialize(signal);while(restarted.snapshot().captureQueue.pending)await restarted.step(signal);
+ expect((await fixture.admin.query('SELECT id FROM olos_export.batches WHERE run_id IN (SELECT id FROM olos_export.runs WHERE contract_version=$1)',[p.review.plan.contract.version])).rows).toEqual(before);
+});
 
 it('queue restart reconciles confirmed receipts, but absent receipts block before acquisition and are never resent',async()=>{
  for(const committed of [true,false]){

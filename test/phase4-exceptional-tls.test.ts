@@ -76,8 +76,9 @@ it('capacidade corporativa não pode ser emitida em Vitest, Fastify, scheduler o
 it('claim excepcional é durável, concorrente, compartilhado com modo seguro e não apagado após erro',async () => {
   const root = await mkdtemp(join(tmpdir(),'phase4-tls-claim-')); const a = approval(); let calls = 0;
   try {
-    const results = await Promise.allSettled([onceExceptional(root,a,async () => { calls++; throw new Error('synthetic'); }),
-      onceExceptional(root,a,async () => { calls++; })]);
+    // Either filesystem contender can win; the winner must fail to exercise durable failure fencing.
+    const failAfterClaim=async()=>{calls++;throw new Error('synthetic');};
+    const results = await Promise.allSettled([onceExceptional(root,a,failAfterClaim),onceExceptional(root,a,failAfterClaim)]);
     expect(results.every(r => r.status === 'rejected')).toBe(true); expect(calls).toBe(1);
     await expect(assertNoSourceAttempt(root)).rejects.toBeDefined();
     const { tlsMode: _,riskConfirmation: _r,operator: _o,issuedAt: _i,configurationDigest: _d,...base } = a;

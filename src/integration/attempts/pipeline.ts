@@ -11,6 +11,7 @@ import { AttemptsService,type RuntimePools } from './service.js';
 import {projectionClaimBatchSize} from '../../projection/outbox.js';
 import {isTdsResponseReplay} from '../../olos/tds/source.js';
 import {assertUuid} from '../../persistence/validation.js';
+import {annotateFailure,type FailureContext} from '../../diagnostics/worker-failure.js';
 
 export interface AttemptsBinding {
   // Corporate bindings require registration by the reviewed factory; SELECT adapters remain unavailable.
@@ -59,11 +60,15 @@ export function createAttemptsPipeline(ingest:Pool,project:Pool,receiver:Pool,sp
     if(!isTdsResponseReplay(source) && !(binding.kind==='isolated-fixture' && source.kind==='synthetic'))throw Error('LOCAL_REPLAY_REQUIRED');
     return coordinator.receive(binding.plan(),source,signal);
   },async deliverStep(batchId:string,signal:AbortSignal){
+    let stage:FailureContext['stage']='RECONCILE';try{
     await reconcileLocal(batchId,signal);
+    stage='DELIVER';
     const count=await delivery.dispatcher.runBatch(signal,projectionClaimBatchSize,batchId);
+    stage='DELIVERY_STATUS';
     const pending=(await project.query("SELECT 1 FROM olos_export.projection_outbox WHERE destination_id=$1 AND batch_id=$2 AND state<>'confirmed' LIMIT 1",[binding.destinationId,batchId])).rowCount;
     if((await project.query("SELECT 1 FROM olos_export.projection_outbox WHERE destination_id=$1 AND batch_id=$2 AND state IN ('rejected','uncertain') LIMIT 1",[binding.destinationId,batchId])).rowCount)throw Error('DELIVERY_REQUIRES_RECONCILIATION');
     return {count,complete:!pending};
+    }catch(error){throw annotateFailure(error,{flow:'delivery',stage,batchId});}
   },async recoverLocal(signal:AbortSignal):Promise<CycleCounts>{
     const r=await coordinator.recover(signal);if(r.manifest && !r.result)throw Error('RECOVERY_REQUIRED');await drain(signal);return r.result??empty;
   },async cycle(signal:AbortSignal):Promise<CycleCounts>{

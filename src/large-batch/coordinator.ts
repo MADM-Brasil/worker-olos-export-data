@@ -1,4 +1,5 @@
 import { isControlledDispositionSource } from '../integration/disposition.js';
+import {annotateFailure,preserveFailure} from '../diagnostics/worker-failure.js';
 import { isIsolatedTdsSource, assertRegisteredTdsExecution } from '../olos/tds/source.js';
 import { randomUUID } from 'node:crypto';
 import type { PostgresPersistence } from '../persistence/store.js';
@@ -22,7 +23,7 @@ export class LargeBatchCoordinator {
       return result;
     } catch (e) {
       try { await this.spool.mark(m,'uncertain'); } catch { /* intent/arquivo original permanece; nenhuma leitura liberada */ }
-      throw e;
+      throw annotateFailure(e,{stage:'MATERIALIZE',batchId:m.identity.batchId,streamId:m.identity.streamId});
     }
   }
   async receive(input: LargePlan, source: RawSource, signal: AbortSignal): Promise<BatchCounts> {
@@ -64,7 +65,7 @@ export class LargeBatchCoordinator {
       if (!sealed) { try { await writer?.interrupt(); } catch { /* identidade inicial é a evidência conservadora */ } }
       if (e instanceof PersistenceError || e instanceof SpoolError) throw e;
       if (e !== null && typeof e === 'object' && 'code' in e && ['BUSY','STORAGE_FAILED','DISK_FULL','QUOTA_EXCEEDED','CORRUPT','INCOMPLETE'].includes(String(e.code))) throw new SpoolError(e.code as SpoolError['code']);
-      throw new SpoolError('SOURCE_INTERRUPTED');
+      throw preserveFailure(new SpoolError('SOURCE_INTERRUPTED'),e);
     } finally { if (deadline) clearTimeout(deadline); signal.removeEventListener('abort',cancel); this.busy = false; }
   }
   /** Não chama a origem. Lote sem selo nunca entra em persistência. Lease expirada exige conciliação existente. */

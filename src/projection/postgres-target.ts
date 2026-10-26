@@ -3,6 +3,7 @@ import { transaction } from '../persistence/transaction.js';
 import { PersistenceError } from '../persistence/types.js';
 import { assertUuid } from '../persistence/validation.js';
 import {projectionClaimBatchSize} from './outbox.js';
+import {preserveFailure} from '../diagnostics/worker-failure.js';
 import { exactFlat, ProjectionError } from './transform.js';
 import { TargetDeliveryError, type DeliveryRequest, type DeliveryTarget } from './dispatcher.js';
 import type { Candidate } from './contract.js';
@@ -45,7 +46,7 @@ export class PostgresDeliveryTarget implements DeliveryTarget {
         return 'confirmed';
       });
     } catch (error) {
-      throw new TargetDeliveryError(error instanceof PersistenceError && error.outcome==='not_committed' ? 'not_committed' : 'unknown');
+      throw preserveFailure(new TargetDeliveryError(error instanceof PersistenceError && error.outcome==='not_committed' ? 'not_committed' : 'unknown'),error);
     }
   }
   async receipt(deliveryId: string, expectedDigest: string): Promise<Receipt> {
@@ -84,6 +85,6 @@ export class PostgresDeliveryTarget implements DeliveryTarget {
       const fresh=new Set(inserted.rows.map(r=>r.delivery_id));
       if(fresh.size)await this.writer.writeBatchInTransaction!(client,requests.filter(r=>fresh.has(r.deliveryId)));
       return states;
-    });}catch(error){throw new TargetDeliveryError(error instanceof PersistenceError && error.outcome==='not_committed'?'not_committed':'unknown');}
+    });}catch(error){throw preserveFailure(new TargetDeliveryError(error instanceof PersistenceError && error.outcome==='not_committed'?'not_committed':'unknown'),error);}
   }
 }

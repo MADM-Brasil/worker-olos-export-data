@@ -3,6 +3,7 @@ import { AttemptsRuntimeControl,type WorkerRuntime,type CycleCounts } from './ru
 import { attemptsBlockers } from './contracts.js';
 import {assertAttemptsDestinationSchema} from './destination-schema.js';
 import {setTimeout as delay} from 'node:timers/promises';
+import {annotateFailure,logWorkerFailure,preserveFailure,type FailureContext} from '../../diagnostics/worker-failure.js';
 
 export interface RuntimePools {ingest:Pool;project:Pool;receiver:Pool;}
 export interface LocalDeliveryWork {initialize(signal:AbortSignal):Promise<void>;step(signal:AbortSignal):Promise<boolean>;}
@@ -18,6 +19,7 @@ export class AttemptsService implements WorkerRuntime {
   private stopping=false;
   private deliveryTask:Promise<void>|undefined;
   private checkedAt:string|null=null;
+  private startupFailure:ReturnType<typeof logWorkerFailure>|null=null;
   private readonly abort=new AbortController();
   constructor(readonly pools:RuntimePools,private readonly intervalMs=60000,
     private readonly authorizedCycle?: (signal:AbortSignal)=>Promise<CycleCounts>,private readonly sourceKind='isolated-fixture',private readonly operationalSnapshot?:()=>Record<string,unknown>,private readonly deliveryWork?:LocalDeliveryWork) {
@@ -26,6 +28,10 @@ export class AttemptsService implements WorkerRuntime {
   }
   async probe():Promise<void>{
     if(!this.refreshTask)this.refreshTask=this.refresh().finally(()=>{this.refreshTask=undefined;});return this.refreshTask;
+  }
+  private fail(error:unknown,context:FailureContext){
+    if(this.stopping)return;
+    this.control.requireReconciliation(error,context);this.abort.abort();
   }
   private async refresh(){
     let connected=false;
@@ -63,38 +69,43 @@ export class AttemptsService implements WorkerRuntime {
         FROM olos_export.runs WHERE source_table='AttemptsRawData'`)).rows[0];
       this.aggregates={...this.aggregates,...outbox,checkpoints,ingestionTotals:totals};this.schemaReady=true;this.checkedAt=new Date().toISOString();
       if(!this.authorizedCycle && !this.stopping)this.control.block(['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]);
-    }catch {this.schemaReady=false;this.database=connected?'up':'down';if(this.authorizedCycle && this.control.snapshot().armed){this.abort.abort();this.control.requireReconciliation();}throw Error('POSTGRES_RUNTIME_NOT_READY');}
+    }catch(error) {this.schemaReady=false;this.database=connected?'up':'down';
+      const failure=annotateFailure(preserveFailure(Error('POSTGRES_RUNTIME_NOT_READY'),error),{flow:'probe',stage:'PROBE'});
+      if(this.authorizedCycle && this.control.snapshot().armed)this.fail(failure,{flow:'probe',stage:'PROBE'});throw failure;}
   }
   start():Promise<void>{
     if(this.starting)return this.starting;
     this.starting=(async()=>{
+      let stage:FailureContext['stage']='PROBE';
       try {await this.probe();if(this.stopping || !this.authorizedCycle)return;
+        stage='INSTANCE_LOCK';
         const lock=await this.pools.ingest.connect();this.lock=lock;
-        lock.on('error',()=>{this.abort.abort();this.control.requireReconciliation();});
+        lock.on('error',error=>this.fail(error,{flow:'instance',stage:'INSTANCE_LOCK'}));
         if(!(await lock.query('SELECT pg_try_advisory_lock(740219,1) AS acquired')).rows[0].acquired)throw Error('INSTANCE_BUSY');
-        await this.deliveryWork?.initialize(this.abort.signal);
+        stage='INITIALIZE';try{await this.deliveryWork?.initialize(this.abort.signal);}catch(error){throw annotateFailure(error,{flow:'initialization',stage:'INITIALIZE'});}
         if(this.abort.signal.aborted || this.stopping)throw Error('INSTANCE_LOST');
         this.control.start(async signal=>{
           if(this.abort.signal.aborted || this.stopping)throw Error('INSTANCE_LOST');
           const combined=AbortSignal.any([signal,this.abort.signal]);
-          try{await this.probe();return await this.authorizedCycle!(combined);}catch(error){this.abort.abort();throw error;}finally{await this.probe().catch(()=>{});}
+          try{await this.probe();return await this.authorizedCycle!(combined);}catch(error){this.fail(error,{flow:'acquisition',stage:'ACQUIRE'});throw error;}finally{await this.probe().catch(()=>{});}
         });
         if(this.deliveryWork)this.deliveryTask=this.deliver();
-      }catch {this.abort.abort();this.control.block(['POSTGRES_SCHEMA_ROLE_OR_INSTANCE_NOT_READY',...(!this.authorizedCycle?['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]:[])]);}
+      }catch(error) {if(!this.stopping)this.startupFailure=logWorkerFailure('worker_start_failed',error,{flow:'initialization',stage});
+        this.abort.abort();this.control.block(['POSTGRES_SCHEMA_ROLE_OR_INSTANCE_NOT_READY',...(!this.authorizedCycle?['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]:[])]);}
     })();return this.starting;
   }
   private async deliver(){
     try{while(!this.abort.signal.aborted && !this.stopping){
       const progressed=await this.deliveryWork!.step(this.abort.signal);
       if(!progressed)await delay(250,undefined,{signal:this.abort.signal});
-    }}catch{if(!this.stopping){this.abort.abort();this.control.requireReconciliation();}}
+    }}catch(error){this.fail(error,{flow:'delivery',stage:'DELIVER'});}
   }
   ready(){const s=this.control.snapshot();return !this.stopping && !this.abort.signal.aborted && this.schemaReady && s.enabled;}
   snapshotNextExecutionAt(){return this.control.snapshot().nextExecutionAt;}
   snapshotDatabaseState(){return this.database;}
   snapshotBaseArmed(){return this.control.snapshot().armed;}
   snapshot(){const totals=this.aggregates.ingestionTotals as {unresolved:string}|undefined;
-    return {...this.control.snapshot(),enabled:this.ready(),countsScope:'ingestion_last_completed_cycle',sourceConfigured:Boolean(this.authorizedCycle),sourceAuthorized:Boolean(this.authorizedCycle),
+    return {...this.control.snapshot(),lastFailure:this.control.snapshot().lastFailure??this.startupFailure,enabled:this.ready(),countsScope:'ingestion_last_completed_cycle',sourceConfigured:Boolean(this.authorizedCycle),sourceAuthorized:Boolean(this.authorizedCycle),
     sourceKind:this.authorizedCycle?this.sourceKind:'corporate-blocked',databaseState:this.database,schemaReady:this.schemaReady,statisticsAvailable:this.schemaReady,statisticsCheckedAt:this.checkedAt,
     recoveryPending:this.control.snapshot().state==='needs_reconciliation' || Boolean(totals && totals.unresolved!=='0') || Number(this.aggregates.pendingDeliveries)>0,...this.aggregates,...this.operationalSnapshot?.()};}
   stop():Promise<void>{this.closing ??=this.close();return this.closing;}

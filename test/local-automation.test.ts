@@ -12,6 +12,9 @@ import {exampleProfile,columnTypes,type OfflineProfile} from '../src/offline/mod
 import {createAttemptsPipeline,createAutomatedAttemptsService,type AttemptsBinding} from '../src/integration/attempts/pipeline.js';
 import {AttemptsService,type RuntimePools} from '../src/integration/attempts/service.js';
 import {AttemptsRuntimeControl} from '../src/integration/attempts/runtime-control.js';
+import {annotateFailure} from '../src/diagnostics/worker-failure.js';
+import {PersistenceError} from '../src/persistence/types.js';
+import {randomUUID} from 'node:crypto';
 import {buildApp} from '../src/app.js';
 import {loadConfig} from '../src/config/env.js';
 const profile:OfflineProfile={...exampleProfile,columns:[...APPROVED_COLUMNS],phoneMatchKey:'normalized'};
@@ -107,6 +110,24 @@ describe('HTTP + actual pipeline with three isolated PostgreSQL logins, no Olos'
   try{await runtime.start();await until(()=>deliveryCancelled);expect(calls).toBe(1);await runtime.stop();
    await refused.start();await new Promise(r=>setTimeout(r,60));expect(source).not.toHaveBeenCalled();expect(step).not.toHaveBeenCalled();expect(refused.snapshot().armed).toBe(false);
   }finally{await runtime.stop();await refused.stop();}
+ },15000);
+ it.each(['delivery','acquisition'] as const)('runtime retains the original %s stage and batch after the other flow is aborted',async flow=>{
+  const captureId=randomUUID(),batchId=randomUUID();let begun!:()=>void;const started=new Promise<void>(r=>{begun=r;});
+  const source=vi.fn(async(signal:AbortSignal)=>{
+   begun();if(flow==='acquisition')throw annotateFailure(Error('INCOMPLETE'),{flow,stage:'CAPTURE',captureId});
+   await new Promise<void>(r=>signal.addEventListener('abort',()=>r(),{once:true}));throw Error('STOPPED');
+  });
+  const runtime=new AttemptsService(pools(),20,source,'isolated-fixture',undefined,{initialize:async()=>{},step:async signal=>{
+   await started;if(flow==='delivery')throw annotateFailure(new PersistenceError('LEASE_LOST'),{flow,stage:'SETTLE',captureId,batchId});
+   if(!signal.aborted)await new Promise<void>(r=>signal.addEventListener('abort',()=>r(),{once:true}));throw Error('STOPPED');
+  }});
+  const output=vi.spyOn(process.stderr,'write').mockReturnValue(true);
+  try{await runtime.start();await until(()=>runtime.snapshot().state==='needs_reconciliation');await new Promise(r=>setTimeout(r,80));
+   expect(source).toHaveBeenCalledOnce();expect(runtime.snapshot().lastFailure).toMatchObject({flow,stage:flow==='delivery'?'SETTLE':'CAPTURE',code:flow==='delivery'?'LEASE_LOST':'INCOMPLETE',captureId});
+   if(flow==='delivery')expect(runtime.snapshot().lastFailure).toMatchObject({batchId});
+   expect(output.mock.calls.filter(([line])=>String(line).includes('worker_needs_reconciliation'))).toHaveLength(1);
+   expect(runtime.snapshot().armed).toBe(false);
+  }finally{await runtime.stop();output.mockRestore();}
  },15000);
  it('destination failure stops consumption; restart drains pending deliveries locally before another source call',async()=>{
   await db.admin.query("CREATE FUNCTION raw.fail_target() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture destination failure'; END $$;CREATE TRIGGER fail_target BEFORE INSERT ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION raw.fail_target()");

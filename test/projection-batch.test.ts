@@ -9,6 +9,8 @@ import type {DeliveryClaim} from '../src/projection/outbox.js';
 import type {DeliveryRequest} from '../src/projection/dispatcher.js';
 import {PostgresDeliveryTarget} from '../src/projection/postgres-target.js';
 import {IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
+import {failureDetails} from '../src/diagnostics/worker-failure.js';
+import {isRecoverableClaimFailure} from '../src/projection/dispatcher.js';
 let f:Awaited<ReturnType<typeof projectionLoadFixture>>;
 const signal=()=>new AbortController().signal;
 const states=async()=> (await f.admin.query('SELECT state,count(*)::int n FROM olos_export.projection_outbox GROUP BY state ORDER BY state')).rows;
@@ -60,6 +62,32 @@ it('pending batch claims survive a restart and are reclaimable only after the ex
  expect(await delivery().outbox.claimBatch(randomUUID())).toHaveLength(8);
  expect(await delivery().dispatcher.runBatch(signal())).toBe(0);
  await expire();expect(await delivery().dispatcher.runBatch(signal())).toBe(8);
+});
+it('a real claim lock timeout rolls back all claims before any destination effect and is safe to defer',async()=>{
+ const lock=await f.admin.connect(),d=delivery();let error:unknown;
+ try{await lock.query('BEGIN');await lock.query('LOCK TABLE olos_export.projection_events IN ACCESS EXCLUSIVE MODE');
+  try{await d.dispatcher.runBatch(signal());}catch(e){error=e;}
+  expect(isRecoverableClaimFailure(error)).toBe(true);
+  expect(failureDetails(error)).toMatchObject({stage:'CLAIM',flow:'delivery',code:'BUSY',technicalCode:'55P03'});
+  expect(await counts()).toEqual({business:0,receipts:0});
+  expect((await f.admin.query('SELECT DISTINCT generation::text,lease_owner FROM olos_export.projection_outbox')).rows).toEqual([{generation:'0',lease_owner:null}]);
+ }finally{await lock.query('ROLLBACK');lock.release();}
+ expect(await d.dispatcher.runBatch(signal())).toBe(8);
+},10000);
+it('reproduces a stop after 64 confirmations when settlement loses its lease, then reconciles receipts without resending',async()=>{
+ const batchId=await f.seed(130),d=delivery();expect(await d.dispatcher.runBatch(signal(),64,batchId)).toBe(64);
+ const send=d.target.deliverBatch!.bind(d.target);
+ vi.spyOn(d.target,'deliverBatch').mockImplementationOnce(async requests=>{const result=await send(requests);await expire();return result;});
+ let error:unknown;try{await d.dispatcher.runBatch(signal(),64,batchId);}catch(e){error=e;}
+ expect(failureDetails(error)).toMatchObject({code:'LEASE_LOST',stage:'SETTLE',flow:'delivery',batchId});expect(isRecoverableClaimFailure(error)).toBe(false);
+ expect(await states()).toEqual([{state:'confirmed',n:64},{state:'pending',n:2},{state:'uncertain',n:64}]);
+ expect(await counts()).toEqual({business:128,receipts:128});
+ const before=(await f.admin.query('SELECT delivery_id,request_digest FROM olos_export.delivery_receipts ORDER BY delivery_id')).rows;
+ const restarted=delivery(),writes=vi.spyOn(restarted.target,'deliverBatch');
+ for(const {delivery_id} of (await f.admin.query("SELECT delivery_id FROM olos_export.projection_outbox WHERE state='uncertain'")).rows)expect(await restarted.dispatcher.reconcile(delivery_id)).toBe(true);
+ expect(writes).not.toHaveBeenCalled();expect(await restarted.dispatcher.runBatch(signal(),64,batchId)).toBe(2);
+ expect(await counts()).toEqual({business:130,receipts:130});
+ expect((await f.admin.query('SELECT delivery_id,request_digest FROM olos_export.delivery_receipts WHERE delivery_id=ANY($1::uuid[]) ORDER BY delivery_id',[before.map(r=>r.delivery_id)])).rows).toEqual(before);
 });
 it('a crash after group authorization without receipt remains uncertain after restart, never resent',async()=>{
  const d=delivery(),claims=await d.outbox.claimBatch(randomUUID());

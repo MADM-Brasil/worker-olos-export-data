@@ -774,3 +774,175 @@ concluiu com **794 testes aprovados e 5 ignorados**, em 57 arquivos aprovados e
 executado e aprovado separadamente. `npm run typecheck`, `npm run build` e
 `git diff --check` também passaram. Nenhum commit, push, deploy, RPC real ou
 alteração no PostgreSQL da VPS foi realizado.
+
+## Parada do scheduler em 26/10/2026: diagnóstico e recuperação
+
+Incidente informado: três aquisições completas, `worker_needs_reconciliation` às
+`2026-10-26T16:28:07.950Z`, PreviousDays com 33.984 confirmados/147.789 pendentes
+e um CurrentDay novo com 64 confirmados/199.936 pendentes. Não houve acesso à VPS
+nesta investigação. O evento antigo não permite reconstruir a exceção perdida,
+nem distinguir entrega, aquisição, probe PostgreSQL ou perda do lock.
+
+Defeito confirmado: `AttemptsService.deliver()` descartava a exceção; o controle
+registrava somente o evento genérico. Além disso, os wrappers de transação e
+destino perdiam o código técnico, e uma falha secundária por cancelamento podia
+substituir o instante da falha original. Node permanecer ativo era comportamento
+previsto: o HTTP continua disponível, mas aquisição e entrega ficam interrompidas
+e o processo conserva o advisory lock até o encerramento.
+
+### Hipóteses sustentadas pelo código
+
+| Hipótese | Evidência e como distinguir |
+| --- | --- |
+| Lease de entrega vencida | Cada grupo de até 64 usa lease de 60 s, verificada na autorização e no settle; o claim só toma itens sem lease válida. Se vencer depois do COMMIT no destino, os recibos existem, mas a outbox pode continuar `uncertain`. Um teste, com expiração induzida somente na fixture, reproduz 64 confirmações, perda da lease no grupo seguinte e retomada por recibos sem reenvio. Isso não comprova a causa da VPS. |
+| Contenção, timeout ou falha SQL | Transações usam `lock_timeout=2s`; os pools operacionais têm query/statement timeout de 15 s. Captura, probes e materialização competem por recursos. Uma falha no destino pode retornar pending após rollback confirmado, enquanto COMMIT sem ACK exige reconciliação. Novos logs distinguem, por exemplo, `55P03`, `57014`, `PG_QUERY_TIMEOUT`, violações de constraint e `COMMIT_UNKNOWN`. |
+| Linha rejeitada após o primeiro grupo | O dispatcher prepara cada grupo e pode recusar projeção, versão/mapeamento ou destino. Ter entregue 64 não comprova que os registros seguintes serão aceitos. Etapas `PREPARE`/`DESTINATION`, códigos e estados `rejected`/`pending` ajudam a distinguir. |
+| Materialização de outra captura | `step()` materializa a próxima captura antes de entregar outro grupo. Replay local tem limite de 300 s e usa o fencing da ingestão; falha nessa etapa também interrompe os dois fluxos. A lease da ingestão é renovada durante replay/persistência. Não confundir captura remota completa com materialização PostgreSQL completa. |
+| Checkpoint inconsistente | A confirmação do checkpoint de entrega só ocorre quando o lote não tem pendências. As contagens parciais informadas não demonstram falha nessa etapa. Na inicialização/materialização também se valida a posição de ingestão; lacunas, recibos ou posições divergentes continuam bloqueando. |
+
+O consumidor é único e espera o grupo terminar antes de materializar outro lote.
+Não há evidência de que a simples alternância entre lotes expire suas leases.
+`LEASE_LOST` também pode indicar divergência de owner, generation ou identidade;
+não deve ser interpretado automaticamente como um timeout que permite retry.
+O agregado `pendingDeliveries` usa `state <> 'confirmed'`: inclui `uncertain` e
+`rejected`. É indispensável distinguir esses estados antes da recuperação.
+
+### Tratamento implementado
+
+- `worker_flow_failed` registra a primeira falha na fila; `worker_needs_reconciliation`
+  registra a parada do runtime; `worker_start_failed` identifica recusa de startup.
+  `lastFailure` e `queueFailure` no status autenticado preservam o diagnóstico.
+- Campos: `code`, `message`, `technicalCode`/`technicalMessage`, `causeCodes`
+  limitados, `flow`, `stage`, `captureId`, `batchId`, `streamId`, quando disponíveis,
+  e `retryRemote=false`. A etapa interna não é sobrescrita por um wrapper externo.
+  Mensagens conhecidas são preservadas; texto livre do driver é substituído por
+  mensagens fixas. Nunca são emitidos SQL, parâmetros, payload, stack, credenciais,
+  telefone, CPF ou e-mail. Os IDs permitidos são UUIDs internos, não chaves de negócio.
+- Falha de segurança/integridade interrompe ambos os fluxos. Isso inclui lease
+  perdida, configuração/revisão alterada, spool inválido, checkpoint divergente,
+  autorização/COMMIT desconhecido, erro no destino ou reconciliação inconclusiva.
+  O primeiro diagnóstico permanece intacto após cancelamentos secundários.
+- A única continuidade nova é **BUSY/55P03 no CLAIM, com rollback confirmado**,
+  antes de autorização ou envio. O lote é adiado por 1, 2 e 4 s, no máximo três
+  vezes consecutivas sem progresso. Outros lotes e aquisição podem continuar
+  dentro dos limites normais da fila. A quarta falha interrompe globalmente.
+  `worker_delivery_deferred`, `lastDeferred` e `deferredDeliveries` tornam isso visível.
+  Não há remoção do item, mudança de IDs ou avanço de checkpoint no adiamento.
+- BUSY em materialização, autorização, destino, settle ou checkpoint não recebe
+  essa exceção. Falha no próprio ROLLBACK também bloqueia e nunca é classificada
+  como BUSY recuperável. O contrato existente de `not_committed` sem envio de
+  COMMIT é preservado; COMMIT sem ACK continua `outcome=unknown`.
+  Não foram ampliadas leases, removidos fences ou alterados grants/schema.
+- Não há retry automático de RPC da Olos. O intervalo de aquisição continua em
+  120 segundos após o término do ciclo, com um único proprietário do lock.
+
+Exemplo de diagnóstico sanitizado (IDs são ilustrativos):
+
+```json
+{"event":"worker_needs_reconciliation","code":"LEASE_LOST","message":"LEASE_LOST","flow":"delivery","stage":"SETTLE","captureId":"00000000-0000-4000-8000-000000000001","batchId":"00000000-0000-4000-8000-000000000002","retryRemote":false}
+```
+
+### Recuperação segura do estado informado, após autorização operacional
+
+1. Preservar logs ao redor do incidente, status autenticado, arquivos de casos,
+   hashes, captureIds, batchIds e checkpoints. Não repetir `bootstrap`, `once`,
+   `activate` ou uma RPC para substituir as capturas já existentes.
+2. Parar coordenadamente o processo V2 com SIGTERM e aguardar seu encerramento,
+   inclusive grupos autorizados em andamento. Suspender o reinício automático
+   de aquisições durante a investigação. Um Node ainda vivo pode manter o lock;
+   não executar importadores concorrentes nem forçar alterações de lease.
+3. Com acesso PostgreSQL operacional autorizado, consultar apenas metadados e
+   agregados dos **batchIds originais**. Exemplos somente leitura; substituir os
+   placeholders pelos IDs dos manifestos existentes:
+
+   ```sql
+   SELECT batch_id, state, last_code, count(*) AS deliveries,
+          count(*) FILTER (WHERE lease_until > clock_timestamp()) AS live_leases,
+          max(lease_until) AS latest_lease_until
+   FROM olos_export.projection_outbox
+   WHERE batch_id IN ('<previous-batch-uuid>'::uuid, '<current-batch-uuid>'::uuid)
+   GROUP BY batch_id, state, last_code ORDER BY batch_id, state, last_code;
+
+   SELECT o.batch_id, o.state, count(*) AS deliveries,
+          count(*) FILTER (WHERE r.delivery_id IS NULL) AS without_receipt,
+          count(*) FILTER (WHERE r.delivery_id IS NOT NULL AND
+            (r.request_digest IS DISTINCT FROM o.request_digest OR
+             r.destination_version IS DISTINCT FROM p.destination_version OR
+             r.mapping_version IS DISTINCT FROM p.mapping_version)) AS conflicting_receipts
+   FROM olos_export.projection_outbox o
+   JOIN olos_export.projection_batches p USING (batch_id, destination_id)
+   LEFT JOIN olos_export.delivery_receipts r USING (delivery_id, destination_id)
+   WHERE o.batch_id IN ('<previous-batch-uuid>'::uuid, '<current-batch-uuid>'::uuid)
+     AND o.state IN ('confirmed', 'uncertain')
+   GROUP BY o.batch_id, o.state ORDER BY o.batch_id, o.state;
+
+   SELECT b.id AS batch_id, b.run_id, b.stream_id, b.state, b.expected_version,
+          x.manifest_digest, x.record_count, c.version AS delivery_version,
+          c.last_batch_id
+   FROM olos_export.batches b
+   LEFT JOIN olos_export.large_batch_receipts x ON x.batch_id=b.id
+   LEFT JOIN olos_export.checkpoints c ON c.stream_id=b.stream_id
+   WHERE b.id IN ('<previous-batch-uuid>'::uuid, '<current-batch-uuid>'::uuid);
+   ```
+
+   Ausência de recibo para `uncertain` **não prova ausência de efeito**. Recibos
+   divergentes, lote sem selo/recibo ou checkpoint incompatível exigem revisão;
+   não executar UPDATE para converter estados, encurtar leases ou saltar posições.
+4. Após atualização autorizada somente do worker, manter o scheduler parado e
+   usar o mesmo usuário, volume, configuração e work-dir. Aguardar leases ainda
+   válidas; executar uma única instância de recuperação local:
+
+   ```bash
+   SYNC_ENABLED=false node dist/cli/adapters/attempts-corporate.js recover-queue \
+     --config "$HOME/.config/olos-worker/attempts-service.json" \
+     --work-dir "$HOME/.local/state/olos-worker/corporate-attempts/service-run" \
+     --confirm LOCAL_RECOVERY_ONLY
+   ```
+
+   O comando não contata a Olos. Revalida capturas/lotes existentes, reconcilia
+   recibos e entrega localmente o que é elegível. Uma lease ainda válida ou um
+   adiamento sem progresso pode fazê-lo encerrar conservadoramente; corrigir a
+   causa/aguardar antes de nova tentativa local. `uncertain` sem recibo conclusivo
+   permanece bloqueado. Não repetir o comando em loop para contornar a recusa.
+5. Conferir o mesmo lote, manifesto, IDs e digests; confirmar estados/recibos e
+   avanço contíguo de checkpoint por stream. Revisar os novos logs antes de voltar
+   ao `start --interval-ms 120000` como processo principal único. Drenar localmente
+   nesta recuperação é uma escolha conservadora; a ativação V2 continua aceitando
+   backlog comprovadamente recuperável após validação. Não apagar marcadores,
+   fabricar `delivered.json`, retroceder versão com fila pendente ou recriar ingestão.
+
+Todos os ensaios desta correção usam fixtures locais descartáveis. A reprodução
+de lease e os logs novos não constituem confirmação da causa de produção nem
+autorização de deploy. Não houve RPC real, acesso à VPS, commit ou push.
+
+### Validação da correção de falhas
+
+`npm test -- --maxWorkers=2 --testTimeout=60000`: **820 aprovados, 5 opcionais
+ignorados**, em 58 arquivos aprovados (291,46 s). `npm run typecheck`,
+`npm run build` e `git diff --check` passaram. A cobertura inclui erros de
+aquisição/entrega, lease vencida após recibos, timeout real de lock com rollback,
+adiamento limitado, checkpoint, reinício, deduplicação e sanitização de logs.
+Após o último ajuste de contexto dos logs, `test/attempts-service-delivery.test.ts`
+e `test/worker-failure.test.ts` passaram novamente: **30 testes**, com um worker
+e timeout de 30 s. Typecheck e build também foram repetidos com sucesso.
+
+Na primeira execução, uma fixture TDS excedeu 30 s; passou isolada com o mesmo
+limite. O timeout de 60 s acima pertence somente ao executor de testes. A suíte
+também revelou uma corrida em `test/phase4-exceptional-tls.test.ts`: uma das duas
+operações concorrentes não simulava a falha, mas o teste presumia que a outra
+sempre venceria. Ambas agora simulam o mesmo erro após claim, conservando as
+asserções de exclusividade/evidência. Nenhum código ou requisito TLS foi alterado.
+
+Arquivos desta correção:
+
+- `src/diagnostics/worker-failure.ts`: vocabulário sanitizado e contexto de falha.
+- `src/integration/attempts/service.ts`, `runtime-control.ts` e `pipeline.ts`:
+  causa original, fluxo/etapa e parada do runtime.
+- `adapters/attempts-service.ts`: IDs de captura/lote, status e adiamento restrito.
+- `src/persistence/transaction.ts`, `src/projection/dispatcher.ts`,
+  `src/projection/postgres-target.ts` e `src/large-batch/coordinator.ts`:
+  preservação de códigos técnicos nas fronteiras de execução.
+- `test/worker-failure.test.ts`, `test/attempts-service-delivery.test.ts`,
+  `test/local-automation.test.ts`, `test/projection-batch.test.ts` e
+  `test/phase4-exceptional-tls.test.ts`: regressões e fixture concorrente.
+- `docs/service-activation.md`: auditoria, hipóteses e procedimento operacional.
