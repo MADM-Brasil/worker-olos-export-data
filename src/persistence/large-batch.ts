@@ -51,6 +51,16 @@ export class PostgresLargeBatchPersistence implements WholeBatchWriter {
       const {tip}=await this.deliveryTail(c,handle.streamId);return {version:tip.version,cursor:tip.cursor_value};
     });
   }
+  /** Validate recovery before acquisition; never advance the delivery checkpoint here. */
+  async validateDeliveryPosition(m:SpoolManifest){
+    if(!this.independentDelivery)throw new PersistenceError('VALIDATION_FAILED');
+    await transaction(this.pool,async c=>{
+      const {cp,rows}=await this.deliveryTail(c,m.identity.streamId);
+      if(BigInt(m.identity.expected.version)>=BigInt(cp.version)){
+        if(!rows.some(r=>r.id===m.identity.batchId && r.expected_version===m.identity.expected.version))throw new PersistenceError('CHECKPOINT_CONFLICT');
+      }else if((await c.query("SELECT 1 FROM olos_export.projection_outbox WHERE batch_id=$1 AND state<>'confirmed' LIMIT 1",[m.identity.batchId])).rowCount)throw new PersistenceError('CHECKPOINT_CONFLICT');
+    });
+  }
   async preflight(plan: LargePlan): Promise<void> {
     await transaction(this.pool,async client => {
       const versions = (await client.query<{ version: number }>('SELECT version FROM olos_export.large_batch_schema_versions ORDER BY version')).rows;

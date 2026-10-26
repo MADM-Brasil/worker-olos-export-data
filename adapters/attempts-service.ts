@@ -166,12 +166,23 @@ export const recoveryApprovalSchema=z.object({scope:z.literal('OLOS_CONSUMPTIVE_
  captureIds:z.tuple([z.string().uuid(),z.string().uuid()]),operator:text,reference:text,approvedAt:z.string().datetime(),
  ownershipEvidence:text,retentionCompletenessEvidence:text,recoveryExerciseEvidence:text,externalRunbookReference:text,
  failurePolicy:z.literal('STOP_PRESERVE_EXTERNAL_RECONCILIATION_NO_REMOTE_RETRY')}).strict();
-export async function promoteService(root:string,loaded:Loaded,approval:ServiceApproval,input:unknown){
+/** Migration, when supplied, runs under the caller's instance lock and never calls Olos. */
+export async function promoteService(root:string,loaded:Loaded,approval:ServiceApproval,input:unknown,
+ migration?:{options:ServiceOptions;pools:RuntimePools;signal:AbortSignal;guard:()=>void}){
  const reviews=await reviewsFor(root,loaded),activation=validateActivation(input,loaded.config,loaded.configurationDigest,approval,reviews);
  const recovery=recoveryApprovalSchema.parse(await privateJson(activation.recoveryEvidence));
  if(recovery.configurationDigest!==loaded.configurationDigest || recovery.captureIds.some((id,i)=>id!==reviews[i]!.captureId) || Date.parse(recovery.approvedAt)>Date.now())throw Error('RECOVERY_NOT_ESTABLISHED');
- for(const review of reviews){const ack=await privateJson(join(root,'cases',review.captureId,'delivered.json')) as {captureSha256:string;reviewDigest:string};
-  if(ack.captureSha256!==review.captureSha256 || ack.reviewDigest!==digest(review))throw Error('BOOTSTRAP_DELIVERY_NOT_CONFIRMED');}
+ if(migration){
+  if(migration.options.root!==root)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
+  const queue=createServiceCaptureQueue(migration.options,migration.pools,loaded,migration.guard);
+  await queue.initialize(migration.signal,reviews);
+  if(digest(await reviewsFor(root,loaded))!==digest(reviews) || digest(await privateJson(activation.recoveryEvidence))!==digest(recovery))throw Error('ACTIVATION_REQUIREMENTS_MISSING');
+  migration.guard();if(migration.signal.aborted)throw Error('STOPPED');
+ }else{
+  // Retain the serial API's stricter requirement; only validated V2 migration accepts backlog.
+  for(const review of reviews){const ack=await privateJson(join(root,'cases',review.captureId,'delivered.json')) as {captureSha256:string;reviewDigest:string};
+   if(ack.captureSha256!==review.captureSha256 || ack.reviewDigest!==digest(review))throw Error('BOOTSTRAP_DELIVERY_NOT_CONFIRMED');}
+ }
  await durableExclusive(join(root,'activation.json'),{...activation,recoveryDigest:digest(recovery)});
 }
 
@@ -443,17 +454,19 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
   batches=await readdir(join(dir,'import','batches'));
   if(batches.length!==1)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
   const m=await privateJson(join(dir,'import','batches',batches[0]!,'manifest.json')) as SpoolManifest;
-  if(!m.sealed || m.state!=='committed' || canonical(m.identity.plan)!==canonical(plan))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+  if(!m.sealed || m.state!=='committed' || m.rows!==ctx.response.received || m.identity.batchId!==batches[0] || canonical(m.identity.plan)!==canonical(plan))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+  if((await pools.ingest.query('SELECT manifest_digest FROM olos_export.large_batch_receipts WHERE batch_id=$1',[m.identity.batchId])).rows[0]?.manifest_digest!==manifestDigest(m))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
   // The existing receipt path checks the exact manifest digest; never starts a second ingestion.
   await pipeline.writer.persist(m,{runId:m.identity.runId,streamId:m.identity.streamId,fencingToken:m.identity.fencingToken,signal},()=>spool.records(m));
+  await pipeline.writer.validateDeliveryPosition(m);
   item.manifest=m;
  }
  return {
   snapshot:()=>({captureQueue:{pending:items.filter(i=>!i.done).length,materialized:items.filter(i=>!i.done && i.manifest).length,limits,admission},deliveryInFlight:delivering,
    lastDurableCaptureId:last?.attemptId??null,lastProcedure:last?.procedure??null,lastImportConfirmedAt,lastError}),
-  async initialize(signal:AbortSignal){
+  async initialize(signal:AbortSignal,bootstrapReviews:readonly ContractReview[]=[]){
    try{if(initialized)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');check(signal);
-   const knownBatches:string[]=[],knownRuns:string[]=[];
+   const knownBatches:string[]=[],knownRuns:string[]=[],confirmedCaptures=new Set<string>();
    const intents=await Promise.all((await readdir(root)).filter(n=>/^attempt-[a-f0-9-]+\.json$/.test(n)).map(async n=>{
     const intent=captureIntentSchema.parse(await privateJson(join(root,n)));
     if(n!==`attempt-${intent.attemptId}.json` || intent.workDir!==root || intent.configurationDigest!==loaded.configurationDigest)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');return intent;
@@ -486,7 +499,8 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
      if((await pools.ingest.query('SELECT manifest_digest FROM olos_export.large_batch_receipts WHERE batch_id=$1',[ack.batchId])).rows[0]?.manifest_digest!==manifestDigest(manifest) ||
       (await pools.project.query("SELECT 1 FROM olos_export.projection_outbox WHERE batch_id=$1 AND state<>'confirmed' LIMIT 1",[ack.batchId])).rowCount)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
      if(!lastImportConfirmedAt || ack.confirmedAt>lastImportConfirmedAt)lastImportConfirmedAt=ack.confirmedAt;
-     if(pending?.attemptId===intent.attemptId)await finishServiceCase(base,root,intent);
+     confirmedCaptures.add(intent.attemptId);
+     if(pending?.attemptId===intent.attemptId){await enqueue(intent,review);items.at(-1)!.done=true;}
      if(await serviceExists(join(dir,'queued.json')))ordinal=Math.max(ordinal,queuedCaptureSchema.parse(await privateJson(join(dir,'queued.json'))).ordinal);
      last=intent;continue;
     }
@@ -512,11 +526,14 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
    else await durableExclusive(join(root,'queue-mode.json'),mode);
    // Recover already-started work before arming any new acquisition. Expired/uncertain local runs still fail closed.
    let unstarted=false;
-   for(const item of items){if(await serviceExists(join(root,'cases',item.intent.attemptId,'import-started.json'))){
+   for(const item of items){if(item.done)continue;if(await serviceExists(join(root,'cases',item.intent.attemptId,'import-started.json'))){
     if(unstarted)throw Error('CAPTURE_QUEUE_REQUIRES_REVIEW');
     await materialize(item,signal);await item.context!.pipeline.reconcileLocal(item.manifest!.identity.batchId,signal);
    }else unstarted=true;}
-   initialized=true;
+   for(const review of bootstrapReviews){
+    if(!confirmedCaptures.has(review.captureId) && !items.some(i=>i.entry.captureId===review.captureId && i.entry.reviewDigest===digest(review) && i.manifest))throw Error('BOOTSTRAP_PERSISTENCE_NOT_CONFIRMED');
+   }
+   check(signal);initialized=true;
    }catch(error){failed=true;lastError??=queueError(error);throw error;}
   },
   async acquire(signal:AbortSignal){
@@ -596,10 +613,10 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
   while((queue.snapshot().captureQueue.pending)>0){if(!await queue.step(signal))throw Error('DELIVERY_REQUIRES_RECONCILIATION');}
   return {event:'service_queue_recovered',...queue.snapshot(),acquisitionPerformed:false,schedulerStarted:false};
  },true);
- if(action==='activate'){
-  if(await serviceExists(join(options.base,'remote-pending.json')))throw Error('RECOVERY_REQUIRED');
-  await promoteService(options.root,loaded,approval,await privateJson(flags['--activation-file']!));return {state:'ACTIVE',schedulerStarted:false};
- }
+ if(action==='activate')return withLocalLock(options,async(pools,signal)=>{
+  await promoteService(options.root,loaded,approval,await privateJson(flags['--activation-file']!),{options,pools,signal,guard});
+  return {state:'ACTIVE',schedulerStarted:false,acquisitionPerformed:false};
+ },true);
  if(action==='start'){
   await assertActive(options,loaded,approval);
   const settings=await localSettings();if(canonical(settings.postgres)!==canonical(loaded.config.postgres))throw Error('POSTGRES_DESTINATION_CHANGED');

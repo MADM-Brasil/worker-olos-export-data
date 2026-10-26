@@ -1,11 +1,12 @@
 import {beforeAll,afterAll,beforeEach,afterEach,it,expect,vi} from 'vitest';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
+import {existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import pg from 'pg';
 import {isolatedPostgres} from './support/postgres.js';
-import {fields,response,collation} from './support/activation-capture.js';
+import {fields,responseForIds,collation} from './support/activation-capture.js';
 import {LocalSpool} from '../adapters/local-spool.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 import {attemptsFixturePlan,signature} from '../src/integration/attempts/contracts.js';
@@ -36,7 +37,7 @@ beforeEach(async()=>{
  vi.spyOn(IsolatedTdsSource.prototype,'call').mockImplementation(()=>{throw Error('REMOTE_RPC_FORBIDDEN_DURING_LOCAL_REPLAY');});
 });
 afterEach(async()=>{expect(IsolatedTdsSource.prototype.call).not.toHaveBeenCalled();vi.restoreAllMocks();await Promise.all(Object.values(pools).map(p=>p.end()));await rm(root,{recursive:true,force:true});});
-async function prepared(version:string,procedure:'ReadDataCurrentDay'|'ReadDataPreviousDays'='ReadDataCurrentDay'){
+async function prepared(version:string,procedure:'ReadDataCurrentDay'|'ReadDataPreviousDays'='ReadDataCurrentDay',rows=1){
  const config=serviceConfigSchema.parse({version:'olos-service/v2',workerId:'isolated-test',endpoint:{server:'10.196.234.11',port:1433,database:'ExportDataV3',user:'OEC',password:'SYNTHETIC'},postgres:{host:'127.0.0.1',port:5434,database:'olos_worker'},pinApprovalFile:'/unused',approvalFile:join(root,'approval.json'),campaignFile:join(root,'campaign.json'),dispositionFile:join(root,'disposition.json'),profile:{...exampleProfile,phoneMatchKey:'normalized',columns:[...APPROVED_COLUMNS]}});
  await writeFile(join(root,'config.json'),JSON.stringify(config),{mode:0o600});
  await writeFile(config.campaignFile,'[]',{mode:0o600});await writeFile(config.dispositionFile,'[]',{mode:0o600});
@@ -46,10 +47,21 @@ async function prepared(version:string,procedure:'ReadDataCurrentDay'|'ReadDataP
  const plan={...template,signature:signature(procedure),fields:fields.map(({sqlLength:_s,collationHex:_c,unicodeMetadataPolicy:_u,...f})=>f) as typeof template.fields,contract:{...template.contract,version},run:{...template.run,contractVersion:version,readType:procedure==='ReadDataCurrentDay'?'current_day' as const:'previous_days' as const,exportDate:controlDate}};
  await fixture.admin.query('INSERT INTO olos_export.source_contracts(source_table,version,approved,fields,key_fields,layout_evidence,key_evidence) VALUES($1,$2,true,$3::jsonb,$4,$5,$6) ON CONFLICT DO NOTHING',[plan.contract.source_table,version,JSON.stringify(plan.contract.fields),plan.contract.key_fields,plan.contract.layout_evidence,plan.contract.key_evidence]);
  const attemptId=randomUUID(),dir=join(root,'cases',attemptId);await mkdir(dir,{recursive:true,mode:0o700});
- const spool=await LocalSpool.open(join(dir,'capture'),spoolLimits()),capture=await spool.createResponseCapture(attemptId);await capture.append(response);const seal=await capture.seal({received:1,fields,responseValidated:true,rawMessageComplete:true,transportSecurity:[{encrypted:true,identityValidated:true,protocol:'TLSv1.2',tlsMode:'certificate-pinned'}]});
+ const spool=await LocalSpool.open(join(dir,'capture'),spoolLimits()),capture=await spool.createResponseCapture(attemptId);await capture.append(responseForIds(Array.from({length:rows},(_,i)=>i+1)));const seal=await capture.seal({received:rows,fields,responseValidated:true,rawMessageComplete:true,transportSecurity:[{encrypted:true,identityValidated:true,protocol:'TLSv1.2',tlsMode:'certificate-pinned'}]});
  const review:ContractReview={version:'olos-contract-review/v1',procedure,captureId:attemptId,captureSha256:seal.sha256,configurationDigest:loaded.configurationDigest,operator:'test-reviewer',reference:'isolated-source-observation',reviewedAt:new Date().toISOString(),sourceTimeZone:'UTC',controlDayOffset:procedure==='ReadDataCurrentDay'?0:-1,partitionSemanticsEvidence:'isolated control bucket',plan,fields};
  const intent=captureIntentSchema.parse({attemptId,procedure,configurationDigest:loaded.configurationDigest,workDir:root,createdAt:`${captureDate}T10:00:00.000Z`,controlDate,operator:'test',approvalReference:'isolated',pinApprovalId:'unused-local',contractReviewDigest:digest(review),plan,state:'PREPARED'});
  await writeFile(join(root,`attempt-${attemptId}.json`),JSON.stringify(intent),{mode:0o600});return {intent,review,loaded};
+}
+async function activationRequest(current:Awaited<ReturnType<typeof prepared>>,previous:Awaited<ReturnType<typeof prepared>>){
+ const grant={scope:'OLOS_ATTEMPTS_SERVICE',approvalId:'test-approval',workerId:current.loaded.config.workerId,configurationDigest:current.loaded.configurationDigest,
+  procedures:['ReadDataCurrentDay','ReadDataPreviousDays'],table:'AttemptsRawData',destination:'olos_worker.raw.olos_calls',operator:'fixture-authority',reference:'isolated approval only',
+  issuedAt:'2020-01-01T00:00:00.000Z',reviewPolicy:'REVOKE_BY_PRIVATE_FILE',revocationFile:join(root,'revoked.json'),bootstrapRecoveryEvidence:'isolated approved first-read exercise'} as const;
+ await writeFile(current.loaded.config.approvalFile,JSON.stringify(grant),{mode:0o600});
+ const recoveryFile=join(root,'recovery.json');await writeFile(recoveryFile,JSON.stringify({scope:'OLOS_CONSUMPTIVE_RECOVERY',configurationDigest:current.loaded.configurationDigest,
+  captureIds:[current.intent.attemptId,previous.intent.attemptId],operator:'test',reference:'fixture-only',approvedAt:new Date().toISOString(),ownershipEvidence:'isolated ownership exercise',retentionCompletenessEvidence:'isolated fixture completeness',recoveryExerciseEvidence:'real local receipt exercise above; NOT Olos proof',externalRunbookReference:'synthetic fixture reference',failurePolicy:'STOP_PRESERVE_EXTERNAL_RECONCILIATION_NO_REMOTE_RETRY'}),{mode:0o600});
+ const request={version:'olos-activation/v1',workerId:current.loaded.config.workerId,configurationDigest:current.loaded.configurationDigest,approvalDigest:digest(grant),
+  contractDigests:{ReadDataCurrentDay:digest(current.review),ReadDataPreviousDays:digest(previous.review)},captureIds:{ReadDataCurrentDay:current.intent.attemptId,ReadDataPreviousDays:previous.intent.attemptId},recoveryEvidence:recoveryFile,operator:'fixture-authority',reference:'fixture-only',issuedAt:new Date().toISOString()};
+ return {grant,request};
 }
 it('PostgreSQL unavailable before import resumes the complete spool locally without a new RPC',async()=>{
  const p=await prepared('service-local-outage/v1'),failure=vi.spyOn(pools.ingest,'query').mockRejectedValueOnce(Error('local postgres down'));
@@ -81,14 +93,7 @@ it('ACTIVE promotion requires both real local deliveries and restart replays a c
  const current=await prepared('service-active-current/v1');await reviewServiceContract(root,current.loaded,current.review);
  await deliverServiceCapture(root,current.loaded,current.intent,current.review,pools,new AbortController().signal);
  const previous=await prepared('service-active-previous/v1','ReadDataPreviousDays');await reviewServiceContract(root,previous.loaded,previous.review);
- const grant={scope:'OLOS_ATTEMPTS_SERVICE',approvalId:'test-approval',workerId:current.loaded.config.workerId,configurationDigest:current.loaded.configurationDigest,
-  procedures:['ReadDataCurrentDay','ReadDataPreviousDays'],table:'AttemptsRawData',destination:'olos_worker.raw.olos_calls',operator:'fixture-authority',reference:'isolated approval only',
-  issuedAt:'2020-01-01T00:00:00.000Z',reviewPolicy:'REVOKE_BY_PRIVATE_FILE',revocationFile:join(root,'revoked.json'),bootstrapRecoveryEvidence:'isolated approved first-read exercise'} as const;
- await writeFile(current.loaded.config.approvalFile,JSON.stringify(grant),{mode:0o600});
- const recoveryFile=join(root,'recovery.json');await writeFile(recoveryFile,JSON.stringify({scope:'OLOS_CONSUMPTIVE_RECOVERY',configurationDigest:current.loaded.configurationDigest,
-  captureIds:[current.intent.attemptId,previous.intent.attemptId],operator:'test',reference:'fixture-only',approvedAt:new Date().toISOString(),ownershipEvidence:'isolated ownership exercise',retentionCompletenessEvidence:'isolated fixture completeness',recoveryExerciseEvidence:'real local receipt exercise above; NOT Olos proof',externalRunbookReference:'synthetic fixture reference',failurePolicy:'STOP_PRESERVE_EXTERNAL_RECONCILIATION_NO_REMOTE_RETRY'}),{mode:0o600});
- const request={version:'olos-activation/v1',workerId:current.loaded.config.workerId,configurationDigest:current.loaded.configurationDigest,approvalDigest:digest(grant),
-  contractDigests:{ReadDataCurrentDay:digest(current.review),ReadDataPreviousDays:digest(previous.review)},captureIds:{ReadDataCurrentDay:current.intent.attemptId,ReadDataPreviousDays:previous.intent.attemptId},recoveryEvidence:recoveryFile,operator:'fixture-authority',reference:'fixture-only',issuedAt:new Date().toISOString()};
+ const {grant,request}=await activationRequest(current,previous);
  await expect(promoteService(root,current.loaded,grant as never,request)).rejects.toThrow();
  await deliverServiceCapture(root,previous.loaded,previous.intent,previous.review,pools,new AbortController().signal);
  await promoteService(root,current.loaded,grant as never,request);
@@ -116,7 +121,7 @@ it('ACTIVE promotion requires both real local deliveries and restart replays a c
  let acquisitions=0,release!:()=>void;
  const syntheticCapture:typeof observeServiceCapture=async(_base,_root,_loaded,_approval,activeGuard,procedure,_signal,review)=>{
   acquisitions++;activeGuard();if(acquisitions===1)await new Promise<void>(r=>{release=r;});
-  const p=await prepared(review!.plan.contract.version,procedure),createdAt=new Date().toISOString(),plan=planForCapture(review!,new Date(createdAt));
+  const p=await prepared(review!.plan.contract.version,procedure),createdAt=`${captureDate}T11:00:00.000Z`,plan=planForCapture(review!,new Date(createdAt));
   p.intent={...p.intent,createdAt,plan,controlDate:plan.run.exportDate,contractReviewDigest:digest(review)};
   await writeFile(join(root,`attempt-${p.intent.attemptId}.json`),JSON.stringify(p.intent),{mode:0o600});
   await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:p.intent.attemptId,workDir:root,configurationDigest:p.loaded.configurationDigest}),{mode:0o600});
@@ -159,6 +164,18 @@ it('queue adopts an interrupted legacy import, preserves its batch/receipts and 
  const restart=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await restart.initialize(new AbortController().signal);expect(await restart.step(new AbortController().signal)).toBe(false);
  await expect(deliverServiceCapture(root,p.loaded,p.intent,p.review,pools,new AbortController().signal)).rejects.toThrow('CAPTURE_QUEUE_RECOVERY_REQUIRED');
 },30000);
+it('migration of a delivered pending uses the durable queue handoff and preserves its acknowledgment',async()=>{
+ const p=await queuedFixture('queued-delivered-adoption/v1'),signal=new AbortController().signal;
+ await deliverServiceCapture(root,p.loaded,p.intent,p.review,pools,signal);
+ const dir=join(root,'cases',p.intent.attemptId),ack=await readFile(join(dir,'delivered.json'),'utf8');
+ const queue=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await queue.initialize(signal);
+ expect(queue.snapshot().captureQueue.pending).toBe(0);expect(await readFile(join(dir,'delivered.json'),'utf8')).toBe(ack);
+ expect(JSON.parse(await readFile(join(dir,'remote-pending.captured.json'),'utf8')).attemptId).toBe(p.intent.attemptId);
+ await expect(readFile(join(p.base,'remote-pending.json'))).rejects.toMatchObject({code:'ENOENT'});
+ await expect(readFile(join(dir,'remote-pending.completed.json'))).rejects.toMatchObject({code:'ENOENT'});
+ const restart=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await restart.initialize(signal);expect(await restart.step(signal)).toBe(false);
+});
+
 it('queue delivers a recent batch first, keeps the delivery checkpoint at the historical gap, and survives restart',async()=>{
  const p=await queuedFixture('queued-order/v1'),signal=new AbortController().signal;
  const first=createServiceCaptureQueue(p.options,pools,p.loaded,()=>{});await first.initialize(signal);
@@ -189,6 +206,111 @@ it.each(['partial','digest'])('queue refuses %s capture evidence without archivi
  expect(JSON.parse(await readFile(join(p.base,'remote-pending.json'),'utf8')).attemptId).toBe(p.intent.attemptId);
  await expect(queue.acquire(new AbortController().signal)).rejects.toThrow('CAPTURE_QUEUE_REQUIRES_REVIEW');
 });
+
+it.each(['none','migration','checkpoint-before','checkpoint-after'])('activates with a partially delivered bootstrap and survives %s failure without reingestion',async failure=>{
+ const signal=new AbortController().signal,current=await prepared(`bootstrap-current-${failure}/v1`);
+ await reviewServiceContract(root,current.loaded,current.review);
+ await deliverServiceCapture(root,current.loaded,current.intent,current.review,pools,signal);
+ const previous=await prepared(`bootstrap-previous-${failure}/v1`,'ReadDataPreviousDays',130);
+ await reviewServiceContract(root,previous.loaded,previous.review);
+ const base=join(root,'control');await mkdir(base,{mode:0o700});
+ const marker={attemptId:previous.intent.attemptId,workDir:root,configurationDigest:previous.loaded.configurationDigest};
+ await writeFile(join(base,'remote-pending.json'),JSON.stringify(marker),{mode:0o600});
+ const runBatch=ProjectionDispatcher.prototype.runBatch;let groups=0;
+ const partial=vi.spyOn(ProjectionDispatcher.prototype,'runBatch').mockImplementation(async function(this:ProjectionDispatcher,...args){if(groups)return 0;const count=await runBatch.apply(this,args);if(count)groups++;return count;});
+ await expect(deliverServiceCapture(root,previous.loaded,previous.intent,previous.review,pools,signal)).rejects.toThrow('DELIVERY_REQUIRES_RECONCILIATION');partial.mockRestore();
+ const batch=(await fixture.admin.query('SELECT * FROM olos_export.batches WHERE run_id IN (SELECT id FROM olos_export.runs WHERE contract_version=$1)',[previous.review.plan.contract.version])).rows[0];
+ const dir=join(root,'cases',previous.intent.attemptId),manifestPath=join(dir,'import','batches',batch.id,'manifest.json'),manifest=await readFile(manifestPath,'utf8');
+ const snapshot=async()=>(await fixture.admin.query('SELECT delivery_id,request_digest,state FROM olos_export.projection_outbox WHERE batch_id=$1 ORDER BY delivery_id',[batch.id])).rows;
+ const before=await snapshot();expect(before.filter(r=>r.state==='confirmed')).toHaveLength(64);expect(before.filter(r=>r.state==='pending')).toHaveLength(66);
+ const checkpoint=async()=>(await fixture.admin.query('SELECT version FROM olos_export.checkpoints WHERE stream_id=$1',[batch.stream_id])).rows[0].version;
+ expect(await checkpoint()).toBe('0');
+ const {grant,request}=await activationRequest(current,previous),options={base,root,configFile:join(root,'config.json'),intervalMs:120000};
+ const migration={options,pools,signal,guard:()=>{}};
+ await expect(readFile(join(root,'queue-mode.json'))).rejects.toMatchObject({code:'ENOENT'});
+ if(failure==='migration'){
+  // Fail after the durable handoff, before activation can be written.
+  await expect(promoteService(root,current.loaded,grant as never,request,{...migration,guard:()=>{if(existsSync(join(root,'queue-mode.json')))throw Error('simulated migration crash');}})).rejects.toThrow('simulated migration crash');
+  await expect(readFile(join(root,'activation.json'))).rejects.toMatchObject({code:'ENOENT'});
+ }
+ await promoteService(root,current.loaded,grant as never,request,migration);
+ expect(await readFile(manifestPath,'utf8')).toBe(manifest);expect(await snapshot()).toEqual(before);expect(await checkpoint()).toBe('0');
+ expect(JSON.parse(await readFile(join(dir,'remote-pending.captured.json'),'utf8'))).toEqual(marker);
+ await expect(readFile(join(base,'remote-pending.json'))).rejects.toMatchObject({code:'ENOENT'});
+ await expect(readFile(join(dir,'delivered.json'))).rejects.toMatchObject({code:'ENOENT'});
+ const capture:typeof observeServiceCapture=async(_b,_r,_l,_a,guard,procedure,_signal,review)=>{
+  guard();expect(procedure).toBe('ReadDataCurrentDay');
+  const next=await prepared(review!.plan.contract.version,procedure);next.intent.contractReviewDigest=digest(review);
+  await writeFile(join(root,`attempt-${next.intent.attemptId}.json`),JSON.stringify(next.intent),{mode:0o600});
+  await writeFile(join(base,'remote-pending.json'),JSON.stringify({...marker,attemptId:next.intent.attemptId}),{mode:0o600});return next.intent;
+ };
+ const synthetic=vi.fn(capture),queue=createServiceCaptureQueue(options,pools,current.loaded,()=>{},synthetic);
+ await queue.initialize(signal);
+ // assertActive accepts the persisted activation while the original 66 deliveries remain pending.
+ expect((await queue.acquire(signal)).acquisitionPerformed).toBe(true);expect(synthetic).toHaveBeenCalledOnce();expect(await snapshot()).toEqual(before);
+ let restarted=createServiceCaptureQueue(options,pools,current.loaded,()=>{});await restarted.initialize(signal);
+ if(failure.startsWith('checkpoint-')){
+  const confirm=PostgresLargeBatchPersistence.prototype.confirmDeliveryCheckpoint;
+  const crash=vi.spyOn(PostgresLargeBatchPersistence.prototype,'confirmDeliveryCheckpoint').mockImplementation(async function(this:PostgresLargeBatchPersistence,m){if(m.identity.batchId!==batch.id)return confirm.call(this,m);if(failure==='checkpoint-after')await confirm.call(this,m);throw Error('simulated checkpoint crash');});
+  await expect((async()=>{while(restarted.snapshot().captureQueue.pending)await restarted.step(signal);})()).rejects.toThrow('simulated checkpoint crash');crash.mockRestore();
+  expect(await checkpoint()).toBe(failure==='checkpoint-after'?'1':'0');
+  await expect(readFile(join(dir,'delivered.json'))).rejects.toMatchObject({code:'ENOENT'});
+  await expect(restarted.acquire(signal)).rejects.toThrow('RECOVERY_REQUIRED');
+  restarted=createServiceCaptureQueue(options,pools,current.loaded,()=>{});await restarted.initialize(signal);
+ }
+ while(restarted.snapshot().captureQueue.pending)await restarted.step(signal);
+ expect(await checkpoint()).toBe('1');expect(await readFile(manifestPath,'utf8')).toBe(manifest);
+ const after=await snapshot();expect(after.map(r=>r.delivery_id)).toEqual(before.map(r=>r.delivery_id));for(const r of before.filter(r=>r.state==='confirmed'))expect(after.find(a=>a.delivery_id===r.delivery_id)).toEqual(r);expect(after.every(r=>r.state==='confirmed')).toBe(true);
+ expect((await fixture.admin.query('SELECT count(*)::int AS n FROM olos_export.delivery_receipts WHERE delivery_id=ANY($1::uuid[])',[before.map(r=>r.delivery_id)])).rows[0].n).toBe(130);
+ expect((await fixture.admin.query('SELECT id FROM olos_export.batches WHERE run_id=$1',[batch.run_id])).rows).toEqual([{id:batch.id}]);
+ // A duplicate bootstrap observation retains its own receipts, without duplicating business keys.
+ expect((await fixture.admin.query('SELECT count(*)::int AS n FROM raw.olos_calls WHERE internal_id_olos BETWEEN 1 AND 130')).rows[0].n).toBe(130);
+},30000);
+
+it.each(['unpersisted','receipt','rows','position','uncertain'])('rejects bootstrap activation with %s evidence and never enables acquisition',async failure=>{
+ const signal=new AbortController().signal,current=await prepared(`reject-current-${failure}/v1`);
+ await reviewServiceContract(root,current.loaded,current.review);await deliverServiceCapture(root,current.loaded,current.intent,current.review,pools,signal);
+ const previous=await prepared(`reject-previous-${failure}/v1`,'ReadDataPreviousDays');await reviewServiceContract(root,previous.loaded,previous.review);
+ const base=join(root,'control');await mkdir(base,{mode:0o700});
+ await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:previous.intent.attemptId,workDir:root,configurationDigest:previous.loaded.configurationDigest}),{mode:0o600});
+ let restore=async()=>{};
+ if(failure!=='unpersisted'){
+  const defer=vi.spyOn(ProjectionDispatcher.prototype,'runBatch').mockResolvedValue(0);
+  await expect(deliverServiceCapture(root,previous.loaded,previous.intent,previous.review,pools,signal)).rejects.toThrow('DELIVERY_REQUIRES_RECONCILIATION');defer.mockRestore();
+  const batch=(await fixture.admin.query('SELECT * FROM olos_export.batches WHERE run_id IN (SELECT id FROM olos_export.runs WHERE contract_version=$1)',[previous.review.plan.contract.version])).rows[0];
+  if(failure==='receipt'){
+   const saved=(await fixture.admin.query('SELECT manifest_digest FROM olos_export.large_batch_receipts WHERE batch_id=$1',[batch.id])).rows[0].manifest_digest;
+   await fixture.admin.query('UPDATE olos_export.large_batch_receipts SET manifest_digest=$2 WHERE batch_id=$1',[batch.id,'0'.repeat(64)]);
+   restore=async()=>{await fixture.admin.query('UPDATE olos_export.large_batch_receipts SET manifest_digest=$2 WHERE batch_id=$1',[batch.id,saved]);};
+  }else if(failure==='rows'){
+   const path=join(root,'cases',previous.intent.attemptId,'import','batches',batch.id,'manifest.json'),saved=await readFile(path,'utf8');
+   await writeFile(path,JSON.stringify({...JSON.parse(saved),rows:2}),{mode:0o600});restore=async()=>{await writeFile(path,saved,{mode:0o600});};
+  }else if(failure==='position'){
+   await fixture.admin.query('UPDATE olos_export.batches SET expected_version=2 WHERE id=$1',[batch.id]);
+   restore=async()=>{await fixture.admin.query('UPDATE olos_export.batches SET expected_version=$2 WHERE id=$1',[batch.id,batch.expected_version]);};
+  }else{
+   const connect=pools.receiver.connect.bind(pools.receiver);let interrupted=false;
+   const lost=vi.spyOn(pools.receiver,'connect').mockImplementation((async()=>{
+    const client=await connect();return new Proxy(client,{get(target,key){if(key==='query')return async(sql:string,...args:unknown[])=>{
+     if(sql==='COMMIT' && !interrupted){interrupted=true;await target.query('ROLLBACK');throw Error('simulated missing commit ACK');}
+     return (target.query as (...a:unknown[])=>Promise<unknown>).call(target,sql,...args);
+    };const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;}});
+   }) as typeof pools.receiver.connect);
+   await expect(deliverServiceCapture(root,previous.loaded,previous.intent,previous.review,pools,signal)).rejects.toThrow('DELIVERY_REQUIRES_RECONCILIATION');lost.mockRestore();expect(interrupted).toBe(true);
+   expect((await fixture.admin.query('SELECT state FROM olos_export.projection_outbox WHERE batch_id=$1',[batch.id])).rows[0].state).toBe('uncertain');
+   // Isolated fixture cleanup after the test proves refusal; never an operational recovery procedure.
+   restore=async()=>{await fixture.admin.query("UPDATE olos_export.projection_outbox SET state='pending' WHERE batch_id=$1",[batch.id]);};
+  }
+ }
+ const {grant,request}=await activationRequest(current,previous),options={base,root,configFile:join(root,'config.json'),intervalMs:120000};
+ const sends=vi.spyOn(ProjectionDispatcher.prototype,'runBatch');
+ await expect(promoteService(root,current.loaded,grant as never,request,{options,pools,signal,guard:()=>{}})).rejects.toThrow();
+ expect(sends).not.toHaveBeenCalled();sends.mockRestore();
+ await expect(readFile(join(root,'activation.json'))).rejects.toMatchObject({code:'ENOENT'});
+ const synthetic=vi.fn<typeof observeServiceCapture>(),blocked=createServiceCaptureQueue(options,pools,current.loaded,()=>{},synthetic);
+ await expect(blocked.acquire(signal)).rejects.toThrow('CAPTURE_QUEUE_REQUIRES_REVIEW');expect(synthetic).not.toHaveBeenCalled();
+ await restore();const recovery=createServiceCaptureQueue(options,pools,current.loaded,()=>{});await recovery.initialize(signal);while(recovery.snapshot().captureQueue.pending)await recovery.step(signal);
+},30000);
 
 it('queue restart reconciles confirmed receipts, but absent receipts block before acquisition and are never resent',async()=>{
  for(const committed of [true,false]){

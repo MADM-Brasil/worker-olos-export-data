@@ -12,7 +12,8 @@ aprovações reais. Não copiar aprovações de fixtures ou de outra operação.
   Não depende de `first-confirmed.json`, nem o fabrica. Cada procedure tem sua
   própria captura/revisão. Não inicia scheduler.
 - `ACTIVE`: ativação persistente vinculada aos dois contratos observados, aos
-  recibos de entrega e ao documento de recuperação externo. Um RPC por ciclo;
+  lotes persistidos e validados e ao documento de recuperação externo. A entrega
+  pode continuar pendente na fila V2 após reconciliação local. Um RPC por ciclo;
   próximo ciclo 120 segundos **após o handoff durável da captura**, sem esperar
   a entrega do histórico. Continua sem sobreposição de RPCs.
 - `RECOVERY_REQUIRED`: caso pendente, erro ou requisito revogado/inválido. Uma
@@ -245,8 +246,10 @@ npm run worker:attempts -- import-capture \
 A revisão verifica todos os bytes, metadados, chave, tipos e projeção das linhas;
 a importação exige também a aprovação exata no PostgreSQL. `import-capture` é
 local: não executa procedure. Repetir o fluxo de bootstrap/revisão/importação para
-`--procedure ReadDataPreviousDays`, com captura/revisão/versão separadas. Só depois
-da entrega confirmada o pending é arquivado. Nenhum first-confirmed fictício é usado.
+`--procedure ReadDataPreviousDays`, com captura/revisão/versão separadas. No fluxo
+serial, só depois da entrega confirmada o pending é arquivado. Se a captura já
+estiver integralmente persistida e restar apenas entrega, `activate` pode migrá-la
+para a fila V2 pelo procedimento abaixo. Nenhum first-confirmed fictício é usado.
 
 ## Promoção e execução contínua
 
@@ -279,7 +282,10 @@ Preparar privadamente a solicitação de ativação:
 Os digests usam SHA-256 de JSON canônico (`digest` em
 `src/persistence/validation.ts`), não o hash do arquivo formatado. O status fornece
 o digest de configuração; approve-contract fornece o digest da revisão. A
-ativação valida as duas capturas e seus recibos locais, além do documento externo.
+ativação valida as duas capturas e seus recibos de persistência, além do documento
+externo. Sob o lock de instância, migra a fila e reconcilia entregas incertas por
+recibos conclusivos. Não exige `delivered.json` para um lote integralmente
+persistido, confirmado e com entrega recuperável. Não drena a fila nem inicia RPC.
 Ela é exclusiva e persistente; mudanças de configuração/contratos exigem revisão
 nova, não regravação silenciosa da aprovação anterior.
 
@@ -593,7 +599,11 @@ novos primeiro: a assinatura e o parâmetro `TableName` permanecem iguais.
    import/batchId/recibos e passa a entregar em background; não exige terminar os
    200.000 antes da primeira aquisição. Se o estado antigo estiver incerto, a
    inicialização falha sem nova RPC. Não apagar nem editar a evidência para liberar.
-6. **Se ainda BOOTSTRAP ou se desejar recuperação exclusivamente local**, executar
+6. **Se não existe `activation.json`, mas ambas as capturas de bootstrap estão
+   persistidas e aprovadas**, executar a ativação local descrita na próxima seção.
+   Isso também se aplica ao status `RECOVERY_REQUIRED` causado pelo pending de
+   uma captura completa. Não é necessário drenar a entrega para promover o serviço.
+7. **Se desejar drenar a fila exclusivamente local, sem ativação**, executar
    uma única instância deste comando, com o scheduler parado:
 
    ```bash
@@ -608,6 +618,80 @@ novos primeiro: a assinatura e o parâmetro `TableName` permanecem iguais.
    inicia scheduler. É repetível após sucesso. Uma lease ainda ativa pode exigir
    aguardar sua expiração; recibo ausente/incerto exige reconciliação. Não depende
    de ACTIVE para importar CurrentDay já aprovado; não cria aprovação de PreviousDays.
+
+### Ativação com entrega parcial de bootstrap — correção de 26/10/2026
+
+O cenário informado é CurrentDay com 200.000 entregas concluídas e PreviousDays
+com 181.773 registros capturados/persistidos, 149.645 entregas pendentes,
+`import-started.json`, manifesto `committed`/`sealed=true`, pending remoto ainda
+presente e ausência de `queue-mode.json`/`activation.json`. Essas contagens foram
+fornecidas pelo operador; não foram consultadas na VPS durante esta alteração.
+
+Auditoria do caminho:
+
+| Etapa | Resultado |
+| --- | --- |
+| `promoteService` / `activate` | O bloqueio antigo exigia ausência de pending e ambos os `delivered.json`. Agora a CLI toma o lock, valida aprovações e usa a inicialização V2 antes de persistir a ativação. |
+| `initialize` | Valida capturas, identidades, contratos, lote/recibo, contagem e posição contígua de ingestão; reconcilia incertezas locais. Para promoção, ambas as capturas de bootstrap precisam estar persistidas ou já entregues e validadas. |
+| `handoffCapture` | Mantém o protocolo exclusivo existente: `queued.json`, fsync, rename para `remote-pending.captured.json`, fsync dos diretórios. Não fabrica ACK de entrega. |
+| `assertActive` | Continua vinculando ativação, autorização, contratos e documento de recuperação por digest, inclusive antes de cada aquisição. Não trata a existência do arquivo de ativação como prova suficiente de recuperação. |
+| `start` / `AttemptsService.start` | Conserva o intervalo de 120.000 ms e só arma o scheduler após inicialização da fila sob o lock. Entrega local continua independente; falha em um fluxo interrompe o outro. |
+
+Procedimento na VPS, **somente em publicação/ativação posteriormente autorizada**:
+
+1. Parar o importador/scheduler anterior com SIGTERM e aguardar seu encerramento.
+   Registrar captureIds, batchIds, hashes, manifestos, recibos, checkpoints e
+   contagens por lote. Preservar os mesmos volumes, work-dir e configuração.
+2. Atualizar somente a imagem do worker pelo fluxo operacional existente.
+   Com o automático parado, executar `service-status` como no passo 4 acima.
+   Conferir a identidade de PreviousDays e os contratos reais de ambas as procedures.
+3. Usar o documento externo de recuperação e a solicitação de ativação aprovados
+   conforme a seção “Promoção e execução contínua”. Não gerar aprovações fictícias
+   nem usar `bootstrap`/`once` para substituir o lote. Executar uma única instância:
+
+   ```bash
+   SYNC_ENABLED=false node dist/cli/adapters/attempts-corporate.js activate \
+     --config "$HOME/.config/olos-worker/attempts-service.json" \
+     --work-dir "$HOME/.local/state/olos-worker/corporate-attempts/service-run" \
+     --activation-file /caminho/privado/activation-request.json \
+     --confirm APPROVE_SERVICE_ACTIVATION
+   ```
+
+   Usar os caminhos originais e o mesmo usuário proprietário do estado. O comando
+   valida também schema, roles e destino PostgreSQL. Só arquiva o pending pelo
+   handoff durável e só grava `activation.json` após as validações. Retorna
+   `schedulerStarted=false` e `acquisitionPerformed=false`. As entregas pending
+   não são enviadas nessa etapa; apenas recibos de incertezas são reconciliados.
+4. Conferir `queued.json`, `remote-pending.captured.json`, `queue-mode.json` e
+   `activation.json`. O captureId, batchId, manifesto e IDs de entrega originais
+   devem permanecer iguais; o checkpoint de entrega não deve avançar pela migração.
+   `delivered.json` continuará ausente enquanto houver entrega pendente.
+5. Iniciar o comando principal `start` abaixo. Ele valida tudo novamente antes
+   da primeira aquisição, programada para 120 segundos após inicialização.
+   Os ciclos seguintes aguardam 120 segundos após concluir a captura/handoff,
+   sem sobreposição de RPCs. Acompanhar o backlog por batchId e o status autenticado.
+
+Se a ativação falhar, não iniciar aquisições nem editar marcadores. Uma falha após
+o handoff pode deixar a fila migrada sem ativação; essa evidência é retomável.
+Após resolver a causa comprovadamente, repetir `activate` se `activation.json`
+ainda não existe. Se ele já existe, conferir status/aprovações e usar `start`,
+que revalida a recuperação. `recover-queue` continua disponível para drenagem
+local. Recibo ausente, resultado desconhecido, captura parcial/corrompida ou
+checkpoint inconsistente exigem reconciliação; ausência de recibo não autoriza retry.
+
+Não remover `queue-mode.json`, `remote-pending.json` ou qualquer evidência para
+ativar, nem retroceder a imagem com fila pendente. A migração não cria uma segunda
+ingestão do lote existente e não modifica schema, grants ou contratos aprovados.
+
+Validação local desta correção (26/10/2026):
+`npm test -- --maxWorkers=2 --testTimeout=30000` passou com **804 testes aprovados
+e 5 opcionais ignorados**, em 57 arquivos aprovados (209,07 s). `npm run typecheck`,
+`npm run build` e `git diff --check` passaram. Dez casos novos cobrem migração,
+reinicialização, ativação com 64 entregas confirmadas e 66 pendentes em um lote
+sintético de 130 registros, deduplicação, falhas antes/depois do checkpoint e
+recusas por evidência inválida/incerta. As RPCs corporativas estão bloqueadas nos
+testes; PostgreSQL é descartável. Não houve ensaio dos 181.773 registros reais,
+alteração de produção, deploy, commit ou push.
 
 Comando principal na imagem Dokploy existente, sob o usuário `node` (usar os
 caminhos originais se a instalação tiver nomes diferentes):
