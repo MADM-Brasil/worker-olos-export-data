@@ -10,7 +10,7 @@ import {fields,responseForIds,collation} from './support/activation-capture.js';
 import {LocalSpool} from '../adapters/local-spool.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 import {attemptsFixturePlan,signature} from '../src/integration/attempts/contracts.js';
-import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle,createServiceCaptureQueue,observeServiceCapture} from '../adapters/attempts-service.js';
+import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle,createServiceCaptureQueue,observeServiceCapture,reconcileServiceIngestion} from '../adapters/attempts-service.js';
 import {serviceConfigSchema,planForCapture,type ContractReview} from '../src/integration/attempts/activation.js';
 import {exampleProfile,columnTypes} from '../src/offline/model.js';
 import {APPROVED_COLUMNS,IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
@@ -21,13 +21,14 @@ import {ProjectionDispatcher} from '../src/projection/dispatcher.js';
 import {ProjectionOutbox} from '../src/projection/outbox.js';
 import {PersistenceError} from '../src/persistence/types.js';
 import {preserveFailure} from '../src/diagnostics/worker-failure.js';
-import {PostgresLargeBatchPersistence} from '../src/persistence/large-batch.js';
+import {PostgresPersistence} from '../src/persistence/store.js';
+import {PostgresLargeBatchPersistence,manifestDigest} from '../src/persistence/large-batch.js';
 import {InspectionDiagnostics} from '../src/olos/tds/inspection-diagnostics.js';
 let fixture:Awaited<ReturnType<typeof isolatedPostgres>>,root:string,captureDate:string,sequence=0;
 let pools:{ingest:pg.Pool;project:pg.Pool;receiver:pg.Pool};
 beforeAll(async()=>{
  fixture=await isolatedPostgres();
- for(const f of ['migrations/003_projection_control.sql','permissions/projection.sql','migrations/005_large_batch_control.sql','permissions/large-batch.sql','migrations/004_delivery_receipts.sql','permissions/receiver.sql'])await fixture.admin.query(await readFile(new URL('../'+f,import.meta.url),'utf8'));
+ for(const f of ['migrations/003_projection_control.sql','permissions/projection.sql','migrations/005_large_batch_control.sql','permissions/large-batch.sql','migrations/004_delivery_receipts.sql','permissions/receiver.sql','migrations/007_local_ingestion_reconciliation.sql','permissions/local-ingestion-reconciliation.sql'])await fixture.admin.query(await readFile(new URL('../'+f,import.meta.url),'utf8'));
  await fixture.admin.query('CREATE SCHEMA raw');
  await fixture.admin.query(`CREATE TABLE raw.olos_calls(${APPROVED_COLUMNS.map(c=>`"${c}" ${columnTypes[c]} ${c==='internal_id_olos'?'PRIMARY KEY':''}`).join(',')})`);
  await fixture.admin.query('GRANT USAGE ON SCHEMA raw TO olos_export_receiver');await fixture.admin.query('GRANT SELECT,INSERT ON raw.olos_calls TO olos_export_receiver');
@@ -66,6 +67,32 @@ async function activationRequest(current:Awaited<ReturnType<typeof prepared>>,pr
   contractDigests:{ReadDataCurrentDay:digest(current.review),ReadDataPreviousDays:digest(previous.review)},captureIds:{ReadDataCurrentDay:current.intent.attemptId,ReadDataPreviousDays:previous.intent.attemptId},recoveryEvidence:recoveryFile,operator:'fixture-authority',reference:'fixture-only',issuedAt:new Date().toISOString()};
  return {grant,request};
 }
+it('explicit ingestion reconciliation preserves the capture and resumes V2 delivery without any RPC',async()=>{
+ const p=await prepared('service-explicit-local-reconciliation/v1','ReadDataCurrentDay',130);
+ await reviewServiceContract(root,p.loaded,p.review);
+ const signal=new AbortController().signal;
+ const failure=vi.spyOn(PostgresLargeBatchPersistence.prototype,'persist').mockRejectedValueOnce(new PersistenceError('LEASE_LOST'));
+ await expect(deliverServiceCapture(root,p.loaded,p.intent,p.review,pools,signal)).rejects.toMatchObject({code:'LEASE_LOST'});failure.mockRestore();
+ const spool=await LocalSpool.open(join(root,'cases',p.intent.attemptId,'import'),spoolLimits()),m=(await spool.active())!;
+ await fixture.admin.query("UPDATE olos_export.source_locks SET lease_until=clock_timestamp()-interval '1 second' WHERE owner_run_id=$1",[m.identity.runId]);
+ const [caseId]=await new PostgresPersistence(pools.ingest).recoverExpired();
+ const generation=(await pools.ingest.query("SELECT generation FROM olos_export.source_locks WHERE source_table='AttemptsRawData'")).rows[0].generation;
+ const a={version:'olos-local-ingestion-reconciliation/v1',authorizationId:randomUUID(),captureId:p.intent.attemptId,batchId:m.identity.batchId,runId:m.identity.runId,recoveryCaseId:caseId,manifestDigest:manifestDigest(m),expectedGeneration:generation,operatorReference:'TEST-LOCAL-ONLY',authorizedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+3600000).toISOString(),decision:'AUTHORIZE_VERIFIED_LOCAL_REPLAY',remoteReplayAllowed:false};
+ const base=join(root,'isolated-control');await mkdir(base,{mode:0o700});
+ await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:p.intent.attemptId,workDir:root,configurationDigest:p.loaded.configurationDigest}),{mode:0o600});
+ const options={base,root,configFile:join(root,'config.json'),intervalMs:120000};
+ const result=await reconcileServiceIngestion(options,p.loaded,pools,a,signal,()=>{});
+ expect(result.batchId).toBe(m.identity.batchId);expect(result.received).toBe(130);expect(result.acquisitionPerformed).toBe(false);
+ expect(existsSync(join(base,'remote-pending.json'))).toBe(true); // only V2 handoff may archive it
+ await reconcileServiceIngestion(options,p.loaded,pools,a,signal,()=>{}); // same proof and receipt
+ const queue=createServiceCaptureQueue(options,pools,p.loaded,()=>{});await queue.initialize(signal);await queue.step(signal);
+ expect((await pools.project.query("SELECT count(*)::int n FROM olos_export.projection_outbox WHERE batch_id=$1 AND state='confirmed'",[m.identity.batchId])).rows[0].n).toBe(64);
+ const restarted=createServiceCaptureQueue(options,pools,p.loaded,()=>{});await restarted.initialize(signal);await restarted.step(signal);await restarted.step(signal);
+ expect(restarted.snapshot().captureQueue.pending).toBe(0);
+ expect((await pools.ingest.query('SELECT version FROM olos_export.checkpoints WHERE stream_id=$1',[m.identity.streamId])).rows[0].version).toBe('1');
+ expect(JSON.parse(await readFile(join(root,'cases',p.intent.attemptId,'delivered.json'),'utf8')).batchId).toBe(m.identity.batchId);
+ expect(existsSync(join(root,'cases',p.intent.attemptId,'remote-pending.captured.json'))).toBe(true);
+},30000);
 it('PostgreSQL unavailable before import resumes the complete spool locally without a new RPC',async()=>{
  const p=await prepared('service-local-outage/v1'),failure=vi.spyOn(pools.ingest,'query').mockRejectedValueOnce(Error('local postgres down'));
  await expect(deliverServiceCapture(root,p.loaded,p.intent,p.review,pools,new AbortController().signal)).rejects.toThrow();failure.mockRestore();

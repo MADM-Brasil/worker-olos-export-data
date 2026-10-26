@@ -946,3 +946,236 @@ Arquivos desta correção:
   `test/local-automation.test.ts`, `test/projection-batch.test.ts` e
   `test/phase4-exceptional-tls.test.ts`: regressões e fixture concorrente.
 - `docs/service-activation.md`: auditoria, hipóteses e procedimento operacional.
+
+## Reconciliação local explícita de ingestão interrompida por LEASE_LOST
+
+Implementação de 26/10/2026: `reconcile-ingestion`. Este comando não inicia o
+scheduler, não invoca uma origem e não chama `ReadData`, `ReReadData` ou `ResetReadData`.
+Seu escopo é deliberadamente restrito: captura AttemptsRawData integralmente selada,
+contrato revisado, run original `needs_reconciliation`, caso `expired_read_intent`,
+checkpoint inicial versão **0**, sem cursor, último lote ou outro lote nesse stream.
+Estados diferentes exigem investigação; o comando não os converte para caber no fluxo.
+
+A ausência de recibo, isoladamente, não libera nada. Sob a mesma advisory lock da
+instância V2, a reconciliação obtém a row lock de `source_locks` com `NOWAIT`.
+Essa é também a lock mantida pela transação de materialização: enquanto outro
+backend/transação preparada ainda a detiver, a prova é recusada. Com a lock obtida,
+a geração antiga já revogada impede novas escritas pelo proprietário anterior.
+Na mesma transação são conferidos run/stream/contrato/PK range, recovery case,
+proprietário e geração atuais, outros runs/casos abertos, checkpoint, batches,
+recibos de ingestão, staging de chaves, envelopes, projeções/outbox, eventos,
+recibos de entrega vinculados e auditoria de commit. As FKs e a transação única
+impedem entrega pelo protocolo sem batch/outbox confirmado. Efeitos externos ao
+protocolo, alterações administrativas ou divergências não são reconciliados por
+presunção; precisam de investigação operacional.
+
+Somente após essa prova, uma transação grava a autorização/prova imutável em
+`local_ingestion_reconciliations`, um evento `manual_review` e uma nova execução
+local com token novo. O caso original permanece aberto e bloqueia `startRun`.
+O replay lê novamente `records.ready` validando hash/bytes/quantidade/contrato,
+usa **o BatchId, RunId de origem, stream, digest e checkpoint esperado originais**
+no lote/recibo, e verifica o novo proprietário por meio do vínculo auditável.
+O run auxiliar não soma registros novamente às estatísticas. Somente o commit
+atômico de envelopes + recibo + projeção conclui os runs e resolve o caso.
+
+O manifesto anterior completo fica no ledger; o manifesto local mantém sua
+identidade e passa a `committed` pelo método normal do spool após o recibo.
+Nenhum `delivered.json` é fabricado. `remote-pending.json` permanece intocado
+pelo comando; somente o handoff durável da fila V2 pode arquivá-lo depois.
+A entrega continua independente em grupos de 64 e o checkpoint só avança após ACKs.
+
+### Leases e o limite de 15 segundos
+
+`query_timeout=15000` e `statement_timeout=15000` limitam cada consulta; o
+`idle_in_transaction_session_timeout='15s'` limita tempo ocioso no backend.
+**Não existe um timeout de 15 segundos para a transação inteira** nesse código.
+A materialização renova a lease de 300 segundos na mesma conexão/transação,
+antes de cada parcela (até 500 registros), mantendo a row lock até o commit.
+Uma renovação externa paralela disputaria essa lock; não foi adicionada.
+O coletor `recoverExpired` usa `SKIP LOCKED` e não pode revogar essa transação ativa.
+
+Pausas de I/O/event loop, pressão de CPU/memória (Compose limita worker e PostgreSQL
+a 0,50 CPU/512 MiB), consultas lentas ou falha de conexão podem impedir progresso.
+Uma pausa longa pode causar timeout de inatividade ou expiração; o token antigo
+continua proibido. Há agora também uma verificação/renovação após a finalização
+da projeção, antes de concluir o lote. Não aumentamos timeouts/leases nem removemos
+checks. O teste PostgreSQL de duração superior a 15 segundos mantém consultas
+ativas e comprova renovação por parcelas; outro expira a lease durante a
+finalização e exige rollback integral. Isso não identifica qual pausa ocorreu na
+VPS; são necessários os logs sanitizados, tempos e métricas do incidente.
+
+### Comandos para o caso confirmado na VPS (não executados nesta entrega)
+
+Executar no diretório do projeto Compose, após revisão/autorização operacional,
+backup consistente de PostgreSQL e do volume `worker_state`, e disponibilização
+aprovada da imagem que contém esta correção. Os comandos abaixo não fazem build,
+deploy, remoção de volume ou RPC. Não usar `docker compose up` durante a recuperação:
+o serviço principal está configurado para iniciar aquisição automaticamente.
+
+1. Parar o serviço e impedir que a plataforma o reinicie durante a janela:
+
+   ```bash
+   docker compose stop worker
+   docker compose ps --all
+   ```
+
+2. Como administrador, conferir o caso e a identidade atual, sem alterar estado:
+
+   ```bash
+   docker compose exec -T postgres psql -U olos_admin -d olos_worker -v ON_ERROR_STOP=1 <<'SQL'
+   BEGIN READ ONLY;
+   SELECT r.id,r.stream_id,r.state,r.fencing_token,r.received_count,r.persisted_count,
+          l.generation,l.owner_run_id,l.lease_until,c.version,c.cursor_value,c.last_batch_id
+   FROM olos_export.runs r
+   JOIN olos_export.source_locks l USING(source_table)
+   JOIN olos_export.checkpoints c USING(stream_id)
+   WHERE r.id='8b9200fa-2a9f-4b12-bd52-ff4fae43a8f8';
+   SELECT id,run_id,state,reason FROM olos_export.recovery_cases
+   WHERE id='555d39b2-592e-4174-9e14-dff3f61ab79e';
+   SELECT b.id,b.state,x.manifest_digest FROM olos_export.batches b
+   LEFT JOIN olos_export.large_batch_receipts x ON x.batch_id=b.id
+   WHERE b.id='9860ee42-4f1d-44d1-b8e2-110d26e39da3'
+      OR b.run_id='8b9200fa-2a9f-4b12-bd52-ff4fae43a8f8';
+   COMMIT;
+   SQL
+   ```
+
+   Para a primeira execução esperam-se token 4, geração 5, proprietário nulo,
+   contadores zero, checkpoint 0/nulo, caso aberto e nenhum lote/recibo.
+   Se divergir, parar e investigar. Essas consultas são diagnóstico; a prova
+   autorizadora é refeita transacionalmente pelo comando.
+
+3. Aplicar **somente a migration nova** e os grants novos, uma vez, após revisão
+   pelo DBA. Não reaplicar/editar migrations anteriores. Se a tabela já existir,
+   verificar a aplicação anterior em vez de contornar o erro.
+
+   ```bash
+   docker compose exec -T postgres psql -U olos_admin -d olos_worker -v ON_ERROR_STOP=1 \
+     < migrations/007_local_ingestion_reconciliation.sql
+   docker compose exec -T postgres psql -U olos_admin -d olos_worker -v ON_ERROR_STOP=1 \
+     < permissions/local-ingestion-reconciliation.sql
+   ```
+
+4. Após aprovação humana, criar um arquivo privado de autorização (válido por uma
+   hora), vinculado ao digest calculado do manifesto real. Informar a referência
+   do chamado/aprovação, sem nomes, credenciais ou dados de clientes:
+
+   ```bash
+   read -r -p 'Referência da aprovação operacional: ' recovery_reference
+   docker compose run --rm --no-deps -T \
+     -e OLOS_RECOVERY_REFERENCE="$recovery_reference" --entrypoint node worker \
+     --input-type=module <<'JS'
+   import {readFile,writeFile} from 'node:fs/promises';
+   import {randomUUID} from 'node:crypto';
+   import {manifestDigest} from './dist/cli/src/persistence/large-batch.js';
+   import {localReconciliationApprovalSchema} from './dist/cli/src/persistence/local-ingestion-reconciliation.js';
+   const root='/home/node/.local/state/olos-worker/corporate-attempts/service-run';
+   const captureId='96581d83-880e-42e4-b9c9-a49800cf45ab';
+   const batchId='9860ee42-4f1d-44d1-b8e2-110d26e39da3';
+   const runId='8b9200fa-2a9f-4b12-bd52-ff4fae43a8f8';
+   const m=JSON.parse(await readFile(`${root}/cases/${captureId}/import/batches/${batchId}/manifest.json`,'utf8'));
+   if(!m.sealed || m.state!=='uncertain' || m.rows!==200000 || m.identity.runId!==runId ||
+      m.identity.batchId!==batchId || m.identity.fencingToken!=='4')throw Error('CASE_DIVERGED');
+   const approval=localReconciliationApprovalSchema.parse({
+     version:'olos-local-ingestion-reconciliation/v1',authorizationId:randomUUID(),
+     captureId,batchId,runId,recoveryCaseId:'555d39b2-592e-4174-9e14-dff3f61ab79e',
+     manifestDigest:manifestDigest(m),expectedGeneration:'5',
+     operatorReference:process.env.OLOS_RECOVERY_REFERENCE,
+     authorizedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+3600000).toISOString(),
+     decision:'AUTHORIZE_VERIFIED_LOCAL_REPLAY',remoteReplayAllowed:false
+   });
+   const file=`${root}/reconcile-ingestion-555d39b2.json`;
+   await writeFile(file,JSON.stringify(approval,null,2)+'\n',{flag:'wx',mode:0o600});
+   console.log(JSON.stringify({authorizationFile:file,authorizationId:approval.authorizationId,
+     manifestDigest:approval.manifestDigest,captureId,batchId,runId}));
+   JS
+   ```
+
+   O arquivo não sobrescreve autorização existente. Não recriá-lo a cada tentativa.
+   A CLI revalida também captura TDS completa, revisão de contrato, configuração,
+   autorização geral do serviço, `import-started.json` e o conteúdo integral do spool.
+
+5. Reconciliar e materializar **localmente**, uma única instância:
+
+   ```bash
+   docker compose run --rm --no-deps -T --entrypoint node worker \
+     dist/cli/adapters/attempts-corporate.js reconcile-ingestion \
+     --config /home/node/.config/olos-worker/attempts-service.json \
+     --work-dir /home/node/.local/state/olos-worker/corporate-attempts/service-run \
+     --reconciliation-file /home/node/.local/state/olos-worker/corporate-attempts/service-run/reconcile-ingestion-555d39b2.json \
+     --confirm AUTHORIZE_VERIFIED_LOCAL_REPLAY
+   ```
+
+   Esperado: evento `local_ingestion_reconciled`, IDs originais acima, novo RunId
+   auditável, token 6, `received=200000`, `persisted+duplicates=200000`, `rejected=0`,
+   `acquisitionPerformed=false`. O checkpoint ainda pode estar em 0 com a fila pendente.
+   Em `COMMIT_UNKNOWN`, não assumir rollback: preservar tudo e repetir o **mesmo**
+   comando/autorização apenas após verificar a causa. O ledger permite retomar a
+   mesma identidade e o recibo impede nova ingestão. Sem resposta conclusiva do banco,
+   com lock ocupada ou divergência, permanece parado.
+
+   Se a nova lease expirar antes do commit, a autorização antiga não pode renová-la.
+   É necessária nova autorização com novo UUID e geração atual conferida, em outro
+   arquivo privado. O procedimento verifica novamente ausência de todos os efeitos,
+   preserva os runs/autorizações anteriores e nunca toma a lock de um sucessor alheio.
+   Não executar `UPDATE`, remover arquivos ou mudar a geração para tentar liberar.
+
+6. Recuperar a entrega existente pela fila durável V2:
+
+   ```bash
+   docker compose run --rm --no-deps -T --entrypoint node worker \
+     dist/cli/adapters/attempts-corporate.js recover-queue \
+     --config /home/node/.config/olos-worker/attempts-service.json \
+     --work-dir /home/node/.local/state/olos-worker/corporate-attempts/service-run \
+     --confirm LOCAL_RECOVERY_ONLY
+   ```
+
+   Esse é o único passo que migra/arquiva o eventual `remote-pending.json`, através
+   do handoff V2. Ele entrega os lotes existentes e avança checkpoints contíguos.
+   Qualquer outra captura incerta interrompe a operação para sua própria análise.
+
+7. Conferir metadados e contadores, sem ler payloads:
+
+   ```bash
+   docker compose exec -T postgres psql -U olos_admin -d olos_worker -v ON_ERROR_STOP=1 <<'SQL'
+   BEGIN READ ONLY;
+   SELECT authorization_id,capture_id,original_run_id,original_batch_id,recovery_run_id,
+          previous_generation,fencing_token,manifest_digest,reconciled_at
+   FROM olos_export.local_ingestion_reconciliations
+   WHERE case_id='555d39b2-592e-4174-9e14-dff3f61ab79e';
+   SELECT b.id,b.run_id,b.state,b.received_count,b.persisted_count,b.duplicate_count,
+          x.record_count,c.version,c.last_batch_id
+   FROM olos_export.batches b JOIN olos_export.large_batch_receipts x ON x.batch_id=b.id
+   JOIN olos_export.checkpoints c ON c.stream_id=b.stream_id
+   WHERE b.id='9860ee42-4f1d-44d1-b8e2-110d26e39da3';
+   SELECT state,count(*) FROM olos_export.projection_outbox
+   WHERE batch_id='9860ee42-4f1d-44d1-b8e2-110d26e39da3' GROUP BY state;
+   SELECT state,resolved_at FROM olos_export.recovery_cases
+   WHERE id='555d39b2-592e-4174-9e14-dff3f61ab79e';
+   COMMIT;
+   SQL
+   ```
+
+   Somente após revisar recibos, checkpoint, fila e logs, a operação pode autorizar
+   novamente o processo principal: `docker compose start worker`. **Esse último
+   comando volta a permitir RPCs de aquisição** com intervalo 120000 ms e fica fora
+   da reconciliação local. Não foi executado nesta entrega.
+
+### Relatório de validação desta implementação
+
+- `npm test -- test/local-ingestion-reconciliation.test.ts test/attempts-service-delivery.test.ts test/large-batch-ingestion.test.ts --maxWorkers=2 --testTimeout=30000`:
+  **59 aprovados**, 3 arquivos, 24,46 s.
+- `npm test -- --maxWorkers=2 --testTimeout=60000`: **836 aprovados, 5 opcionais
+  ignorados**, 59 arquivos aprovados e 3 ignorados, 224,39 s. Inclui carga sintética
+  de 200.000 registros com heap limitado, sem checkpoint parcial.
+- `npm run typecheck`, `npm run build` e `git diff --check`: aprovados.
+- 16 testes novos: 15 de reconciliação PostgreSQL e um fluxo completo com captura
+  TDS local, migração V2, entrega parcial/reinício e proibição de RPC.
+  Cobrem rollback real após escritas parciais, ausência insuficiente de recibo,
+  lock de outro backend, concorrência, fencing antigo, lease expirada, sucessor
+  alheio, autorização/digest/geração, checkpoint divergente, crash após prova,
+  perda de ACK de commit da prova e da ingestão, falha no meio da materialização,
+  deduplicação, duração acima de 15 segundos e expiração na finalização.
+- Bancos descartáveis PostgreSQL 16; sem conexão à produção, RPC real, commit,
+  push ou deploy. A carga local não representa benchmark da VPS nem determina
+  a causa temporal específica da expiração de produção.

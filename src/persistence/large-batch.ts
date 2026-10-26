@@ -1,3 +1,4 @@
+import {assertLocalReconciliation} from './local-ingestion-reconciliation.js';
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { createHash } from 'node:crypto';
@@ -93,23 +94,32 @@ export class PostgresLargeBatchPersistence implements WholeBatchWriter {
     return row;
   }
   async persist(m: SpoolManifest, handle: RunHandle, records: () => AsyncIterable<SpoolRecord>): Promise<BatchCounts> {
+    return this.persistInternal(m,handle,records,false);
+  }
+  /** Explicit local recovery only; the immutable original identity/digest remains the batch identity. */
+  async persistReconciled(m:SpoolManifest,handle:RunHandle,records:()=>AsyncIterable<SpoolRecord>):Promise<BatchCounts>{
+    return this.persistInternal(m,handle,records,true);
+  }
+  private async persistInternal(m:SpoolManifest,handle:RunHandle,records:()=>AsyncIterable<SpoolRecord>,reconciled:boolean):Promise<BatchCounts>{
     assertUuid(m.identity.batchId); assertUuid(handle.runId); assertUuid(handle.streamId); assertVersion(handle.fencingToken);
     assertVersion(m.identity.expected.version);
     if (!m.sealed || !/^[a-f0-9]{64}$/.test(m.sha256 ?? '') || m.rows < 0 || m.rows > this.limits.maxRows ||
-      handle.runId !== m.identity.runId || handle.streamId !== m.identity.streamId || handle.fencingToken !== m.identity.fencingToken) throw new PersistenceError('VALIDATION_FAILED');
+      (!reconciled && handle.runId !== m.identity.runId) || handle.streamId !== m.identity.streamId || (!reconciled && handle.fencingToken !== m.identity.fencingToken)) throw new PersistenceError('VALIDATION_FAILED');
     const bound = structuredClone(m), checksum = manifestDigest(bound), batchId = bound.identity.batchId;
     return transaction(this.pool,async client => {
       const versions = (await client.query<{ version: number }>('SELECT version FROM olos_export.large_batch_schema_versions ORDER BY version')).rows;
       if (versions.length !== 1 || versions[0]?.version !== 1) throw new PersistenceError('SCHEMA_NOT_READY');
       const coreVersions = (await client.query<{ version: number }>('SELECT version FROM olos_export.schema_versions ORDER BY version')).rows;
       if (canonical(coreVersions) !== canonical([{ version: 1 },{ version: 2 }])) throw new PersistenceError('SCHEMA_NOT_READY');
+      if(reconciled)await assertLocalReconciliation(client,bound,handle);
       const prior = (await client.query<{ manifest_digest: string; run_id: string; stream_id: string; received_count: number; persisted_count: number; duplicate_count: number; rejected_count: number; state: string }>(
         `SELECT x.manifest_digest,b.* FROM olos_export.large_batch_receipts x JOIN olos_export.batches b ON b.id=x.batch_id WHERE batch_id=$1`,[batchId])).rows[0];
       if (prior) {
-        if (prior.manifest_digest !== checksum || prior.run_id !== handle.runId || prior.stream_id !== handle.streamId || prior.state !== 'committed') throw new PersistenceError('BATCH_CONFLICT');
+        if (prior.manifest_digest !== checksum || prior.run_id !== bound.identity.runId || prior.stream_id !== handle.streamId || prior.state !== 'committed') throw new PersistenceError('BATCH_CONFLICT');
         return { received: prior.received_count, persisted: prior.persisted_count, duplicates: prior.duplicate_count, rejected: prior.rejected_count };
       }
       const run = await this.guard(client,bound,handle);
+      if(reconciled){const evidence=await assertLocalReconciliation(client,bound,handle);if(evidence.case_state!=='open' || evidence.original_state!=='needs_reconciliation')throw new PersistenceError('RECOVERY_REQUIRED');}
       const contract = (await client.query<SourceContract>('SELECT * FROM olos_export.source_contracts WHERE source_table=$1 AND version=$2',
         [run.source_table,run.contract_version])).rows[0];
       if (!contract) throw new PersistenceError('CONTRACT_UNCONFIRMED'); assertContract(contract);
@@ -118,10 +128,10 @@ export class PostgresLargeBatchPersistence implements WholeBatchWriter {
         (await client.query<{ version: string; cursor_value: string | null }>('SELECT version,cursor_value FROM olos_export.checkpoints WHERE stream_id=$1 FOR UPDATE',[handle.streamId])).rows[0];
       if (!cp || cp.version !== bound.identity.expected.version || cp.cursor_value !== bound.identity.expected.cursor) throw new PersistenceError('CHECKPOINT_CONFLICT');
       // Uma resposta por run. Não sobrescrever totais de um run que já usou o protocolo anterior.
-      const pending = await client.query('SELECT 1 FROM olos_export.batches WHERE run_id=$1',[handle.runId]);
+      const pending = await client.query('SELECT 1 FROM olos_export.batches WHERE run_id=$1',[bound.identity.runId]);
       if (pending.rowCount) throw new PersistenceError('RECOVERY_REQUIRED');
       await client.query(`INSERT INTO olos_export.batches(id,run_id,stream_id,source_table,digest,expected_version,previous_cursor,next_cursor,state,received_count)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$7,'read_observed',$8)`,[batchId,handle.runId,handle.streamId,run.source_table,checksum,cp.version,cp.cursor_value,bound.rows]);
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$7,'read_observed',$8)`,[batchId,bound.identity.runId,handle.streamId,run.source_table,checksum,cp.version,cp.cursor_value,bound.rows]);
       await client.query(`INSERT INTO olos_export.large_batch_receipts(batch_id,manifest_digest,data_digest,record_count,format_version)
         VALUES ($1,$2,$3,$4,'olos-spool/v1')`,[batchId,checksum,bound.sha256,bound.rows]);
       const capture = this.projection
@@ -164,6 +174,7 @@ export class PostgresLargeBatchPersistence implements WholeBatchWriter {
       if (received !== bound.rows || bytes !== bound.bytes || hash.digest('hex') !== bound.sha256) throw new PersistenceError('VALIDATION_FAILED');
       await this.guard(client,bound,handle);
       if (capture) await capture.finish();
+      await this.guard(client,bound,handle); // Finalization is work too; never commit after its lease expires.
       if(!this.deferCheckpointUntilDelivery){
       const changed = await client.query(`UPDATE olos_export.checkpoints SET version=version+1,last_batch_id=$2,last_success_at=clock_timestamp()
         WHERE stream_id=$1 AND version=$3 AND cursor_value IS NOT DISTINCT FROM $4`,[handle.streamId,batchId,cp.version,cp.cursor_value]);
@@ -171,10 +182,16 @@ export class PostgresLargeBatchPersistence implements WholeBatchWriter {
       }
       const duplicates = received - persisted;
       await client.query(`UPDATE olos_export.batches SET state='committed',persisted_count=$2,duplicate_count=$3,committed_at=clock_timestamp() WHERE id=$1`,[batchId,persisted,duplicates]);
-      await client.query(`UPDATE olos_export.runs SET state='succeeded',received_count=$2,persisted_count=$3,duplicate_count=$4,finished_at=clock_timestamp() WHERE id=$1`,[handle.runId,received,persisted,duplicates]);
+      await client.query(`UPDATE olos_export.runs SET state='succeeded',received_count=$2,persisted_count=$3,duplicate_count=$4,finished_at=clock_timestamp() WHERE id=$1`,[bound.identity.runId,received,persisted,duplicates]);
       await client.query('UPDATE olos_export.streams SET last_success_at=clock_timestamp() WHERE id=$1',[handle.streamId]);
       await client.query(`INSERT INTO olos_export.audit_events(id,run_id,batch_id,event,received_count,persisted_count,duplicate_count)
-        VALUES ($1,$2,$3,'batch_committed',$4,$5,$6)`,[randomUUID(),handle.runId,batchId,received,persisted,duplicates]);
+        VALUES ($1,$2,$3,'batch_committed',$4,$5,$6)`,[randomUUID(),bound.identity.runId,batchId,received,persisted,duplicates]);
+      if(reconciled){
+        // Recovery run is an execution link, not a second ingestion in totals.
+        await client.query("UPDATE olos_export.runs SET state='succeeded',finished_at=clock_timestamp() WHERE id=$1",[handle.runId]);
+        await client.query(`UPDATE olos_export.recovery_cases SET state='resolved',resolved_at=clock_timestamp()
+          WHERE run_id=$1 OR run_id IN (SELECT recovery_run_id FROM olos_export.local_ingestion_reconciliations WHERE original_run_id=$1)`,[bound.identity.runId]);
+      }
       if (handle.signal.aborted) throw new PersistenceError('LEASE_LOST');
       await client.query('UPDATE olos_export.source_locks SET owner_run_id=NULL,lease_until=NULL WHERE source_table=$1 AND owner_run_id=$2 AND generation=$3',[run.source_table,handle.runId,handle.fencingToken]);
       return { received, persisted, duplicates, rejected: 0 };

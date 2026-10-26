@@ -1,3 +1,4 @@
+import {localReconciliationApprovalSchema,reconcileLocalIngestion} from '../src/persistence/local-ingestion-reconciliation.js';
 import {mkdir,readdir,lstat,open,rename} from 'node:fs/promises';
 import {constants,openSync,readFileSync,fstatSync,closeSync,existsSync,realpathSync} from 'node:fs';
 import {join,dirname} from 'node:path';
@@ -615,6 +616,30 @@ export function createServiceCaptureQueue(options:ServiceOptions,pools:RuntimePo
 function queueError(error:unknown){
  return failureDetails(error).code;
 }
+/** Explicit operator-authorized, local-only ingestion reconciliation. No source factory is invoked. */
+export async function reconcileServiceIngestion(options:ServiceOptions,loaded:Loaded,pools:RuntimePools,input:unknown,signal:AbortSignal,guard:()=>void){
+ const a=localReconciliationApprovalSchema.parse(input);
+ let stage:FailureContext['stage']='VALIDATE_BATCH';try{
+ const {intent}=await captureInfo(options.root,a.captureId);
+ const review=contractReviewSchema.parse(await privateJson(join(options.root,'reviews',`${intent.procedure}.json`)));
+ const ctx=await captureDelivery(options.root,loaded,intent,review,pools,true);
+ const {spool,dir,plan,response,pipeline}=ctx;
+ if(digest(await privateJson(ctx.started))!==digest({attemptId:a.captureId,reviewDigest:digest(review),captureSha256:response.sha256}))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+ const batches=await readdir(join(dir,'import','batches'));
+ if(batches.length!==1 || batches[0]!==a.batchId)throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+ const m=await privateJson(join(dir,'import','batches',a.batchId,'manifest.json')) as SpoolManifest;
+ if(m.rows!==response.received || canonical(m.identity.plan)!==canonical(plan))throw Error('LOCAL_COMMIT_REQUIRES_REVIEW');
+ guard();await pipeline.writer.preflight(plan);
+ stage='RECONCILE';const handle=await reconcileLocalIngestion(pools.ingest,spool,m,a,signal);
+ guard();
+ stage='MATERIALIZE';const counts=await pipeline.writer.persistReconciled(m,handle,()=>spool.records(m));
+ // Only a confirmed DB receipt permits the normal durable spool transition; no marker forgery.
+ if(await spool.active())await spool.mark(m,'committed');
+ await pipeline.writer.validateDeliveryPosition(m);
+ return {event:'local_ingestion_reconciled',captureId:a.captureId,batchId:a.batchId,originalRunId:a.runId,recoveryRunId:handle.runId,
+  recoveryCaseId:a.recoveryCaseId,fencingToken:handle.fencingToken,...counts,acquisitionPerformed:false,schedulerStarted:false,retryRemote:false};
+ }catch(error){const context:FailureContext={flow:'delivery',stage,captureId:a.captureId,batchId:a.batchId};logWorkerFailure('worker_flow_failed',error,context);throw annotateFailure(error,context);}
+}
 export async function serviceCommand(action:string,options:ServiceOptions,flags:Record<string,string>){
  if(action==='service-status')return operationalServiceStatus(options);
  await directories(options.base,options.root);
@@ -640,6 +665,7 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
   const review=contractReviewSchema.parse(await privateJson(join(options.root,'reviews',`${pending.procedure}.json`)));
   const result=await deliverServiceCapture(options.root,loaded,pending,review,pools,signal);await finishServiceCase(options.base,options.root,pending);return {...result,state:'BOOTSTRAP'};
  },true);
+ if(action==='reconcile-ingestion')return withLocalLock(options,async(pools,signal)=>reconcileServiceIngestion(options,loaded,pools,await privateJson(flags['--reconciliation-file']!),signal,guard),true);
  if(action==='recover-queue')return withLocalLock(options,async(pools,signal)=>{
   const queue=createServiceCaptureQueue(options,pools,loaded,guard);await queue.initialize(signal);
   while((queue.snapshot().captureQueue.pending)>0){if(!await queue.step(signal))throw Error('DELIVERY_REQUIRES_RECONCILIATION');}
