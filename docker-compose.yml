@@ -4,9 +4,22 @@ services:
     build:
       context: .
       target: runtime
-    command: ["node", "dist/main.js"]
+    command:
+      - node
+      - dist/cli/adapters/attempts-corporate.js
+      - start
+      - --config
+      - /home/node/.config/olos-worker/attempts-service.json
+      - --work-dir
+      - /home/node/.local/state/olos-worker/corporate-attempts/service-run
+      - --interval-ms
+      - "120000"
+      - --queue-max-captures
+      - "8"
+      - --queue-max-bytes
+      - "8589934592"
     init: true
-    restart: "no"
+    restart: unless-stopped
     scale: 1
     read_only: true
     cap_drop: [ALL]
