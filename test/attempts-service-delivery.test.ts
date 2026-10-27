@@ -11,7 +11,7 @@ import {fields,responseForIds,collation} from './support/activation-capture.js';
 import {LocalSpool} from '../adapters/local-spool.js';
 import {spoolLimits} from '../src/large-batch/config.js';
 import {attemptsFixturePlan,signature} from '../src/integration/attempts/contracts.js';
-import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle,createServiceCaptureQueue,observeServiceCapture,reconcileServiceIngestion,discardServiceCapture} from '../adapters/attempts-service.js';
+import {deliverServiceCapture,captureIntentSchema,loadServiceConfiguration,reviewServiceContract,promoteService,serviceCycle,createServiceCaptureQueue,observeServiceCapture,reconcileServiceIngestion,discardServiceCapture,closeNotDispatchedServiceCase} from '../adapters/attempts-service.js';
 import {serviceConfigSchema,planForCapture,type ContractReview} from '../src/integration/attempts/activation.js';
 import {exampleProfile,columnTypes} from '../src/offline/model.js';
 import {APPROVED_COLUMNS,IsolatedTdsCallsWriter} from '../src/offline/tds-writer.js';
@@ -30,6 +30,7 @@ let pools:{ingest:pg.Pool;project:pg.Pool;receiver:pg.Pool};
 beforeAll(async()=>{
  fixture=await isolatedPostgres();
  for(const f of ['migrations/003_projection_control.sql','permissions/projection.sql','migrations/005_large_batch_control.sql','permissions/large-batch.sql','migrations/004_delivery_receipts.sql','permissions/receiver.sql','migrations/007_local_ingestion_reconciliation.sql','permissions/local-ingestion-reconciliation.sql','migrations/008_administrative_capture_discard.sql','permissions/administrative-capture-discard.sql'])await fixture.admin.query(await readFile(new URL('../'+f,import.meta.url),'utf8'));
+ for(const f of ['migrations/009_not_dispatched_closures.sql','permissions/not-dispatched-closures.sql'])await fixture.admin.query(await readFile(new URL('../'+f,import.meta.url),'utf8'));
  await fixture.admin.query('CREATE SCHEMA raw');
  await fixture.admin.query(`CREATE TABLE raw.olos_calls(${APPROVED_COLUMNS.map(c=>`"${c}" ${columnTypes[c]} ${c==='internal_id_olos'?'PRIMARY KEY':''}`).join(',')})`);
  await fixture.admin.query('GRANT USAGE ON SCHEMA raw TO olos_export_receiver');await fixture.admin.query('GRANT SELECT,INSERT ON raw.olos_calls TO olos_export_receiver');
@@ -93,6 +94,40 @@ async function interruptedDiscardFixture(){
  const approval={version:'olos-administrative-capture-discard/v1',authorizationId:randomUUID(),captureId:interrupted.intent.attemptId,batchId:m.identity.batchId,runId:m.identity.runId,streamId:m.identity.streamId,recoveryCaseId:caseId,manifestDigest:manifestDigest(m),expectedGeneration:generation,operatorReference:'TEST-DISCARD',reason:'OPERATOR_DECLINED_HISTORICAL_IMPORT',authorizedAt:new Date().toISOString(),expiresAt:new Date(Date.now()+3500000).toISOString(),decision:'AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD',remoteReplayAllowed:false};
  return {prior,previous,interrupted,batch,options,signal,m,approval,spool};
 }
+it('not-dispatched closure preserves previous async delivery and checkpoints across restart',async()=>{
+ const prior=await prepared(`not-dispatched-${sequence}`,'ReadDataCurrentDay',130),signal=new AbortController().signal;
+ await reviewServiceContract(root,prior.loaded,prior.review);
+ const base=join(root,'control');await mkdir(base,{mode:0o700});
+ const options={base,root,configFile:join(root,'config.json'),intervalMs:120000};
+ await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:prior.intent.attemptId,workDir:root,configurationDigest:prior.loaded.configurationDigest}),{mode:0o600});
+ const queue=createServiceCaptureQueue(options,pools,prior.loaded,()=>{});await queue.initialize(signal);await queue.step(signal);
+ const before=(await pools.ingest.query('SELECT * FROM olos_export.checkpoints')).rows;
+ const batch=(await pools.ingest.query('SELECT id FROM olos_export.batches')).rows[0].id;
+ const outbox=()=>pools.project.query('SELECT delivery_id,state FROM olos_export.projection_outbox WHERE batch_id=$1 ORDER BY delivery_id',[batch]);
+ const pending=(await outbox()).rows;expect(pending.filter(r=>r.state!=='confirmed')).toHaveLength(66);
+ const id=randomUUID(),dir=join(root,'cases',id);await mkdir(dir,{mode:0o700});
+ const capture=await (await LocalSpool.open(join(dir,'capture'),spoolLimits())).createResponseCapture(id);await capture.interrupt();
+ const intent={...prior.intent,attemptId:id};await writeFile(join(root,`attempt-${id}.json`),JSON.stringify(intent),{mode:0o600});
+ const diagnostics=new InspectionDiagnostics();diagnostics.observe({kind:'stage',stage:'CONNECTION_INIT_STARTED'});diagnostics.observe({kind:'failure',errorCode:'CONNECTION_FAILED'});
+ const diagnostic={attemptId:id,...diagnostics.snapshot()};
+ for(const [name,value] of Object.entries({'diagnostic.json':diagnostic,'not-dispatched.json':{kind:'olos-local-not-dispatched/v1',attemptId:id,diagnosticDigest:digest(diagnostic),evidence:'CONTROLLED_RPC_HANDOFF_NOT_REACHED_AFTER_TRANSPORT_CLOSED'},'remote-state.json':{state:'REMOTE_OUTCOME_UNKNOWN',attemptId:id,retryRemote:false}}))await writeFile(join(dir,name),JSON.stringify(value),{mode:0o600});
+ await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:id,workDir:root,configurationDigest:prior.loaded.configurationDigest}),{mode:0o600});
+ const plan=intent.plan as ContractReview['plan'],h=await new PostgresPersistence(pools.ingest).startRun(plan.run,signal);
+ const spool=await LocalSpool.open(join(dir,'import'),spoolLimits({minFreeBytes:0}));
+ const writer=await spool.create({format:'olos-spool/v1',batchId:randomUUID(),runId:h.runId,streamId:h.streamId,fencingToken:h.fencingToken,plan,expected:{version:'1',cursor:null}});await writer.interrupt();
+ await fixture.admin.query("UPDATE olos_export.source_locks SET lease_until=clock_timestamp()-interval '1 second' WHERE owner_run_id=$1",[h.runId]);
+ // Same instance lock held by the CLI and by service startup.
+ const lock=await pools.ingest.connect();try{
+  await lock.query('SELECT pg_advisory_lock(740219,1)');
+  await closeNotDispatchedServiceCase(options,id,prior.loaded.configurationDigest,()=>{},signal,pools);
+  expect((await pools.ingest.query('SELECT * FROM olos_export.checkpoints')).rows).toEqual(before);expect((await outbox()).rows).toEqual(pending);
+  const restarted=createServiceCaptureQueue(options,pools,prior.loaded,()=>{});await restarted.initialize(signal);
+  expect(restarted.snapshot().captureQueue.pending).toBe(1);await restarted.step(signal);await restarted.step(signal);
+  expect((await outbox()).rows.every(r=>r.state==='confirmed')).toBe(true);
+  expect((await pools.ingest.query('SELECT version FROM olos_export.checkpoints WHERE stream_id=$1',[h.streamId])).rows[0].version).toBe('1');
+  expect((await pools.ingest.query('SELECT count(*)::int n FROM olos_export.batches WHERE run_id=$1',[h.runId])).rows[0].n).toBe(0);
+ }finally{await lock.query('SELECT pg_advisory_unlock_all()');lock.release();}
+});
 it('discarded capture stays out of the queue while prior deliveries and recurring acquisition continue after restart',async()=>{
  const f=await interruptedDiscardFixture(),{options,signal,prior,previous,approval,m}=f;
  const original=await readFile(join(f.spool.root,'batches',m.identity.batchId,'manifest.json'),'utf8');
@@ -247,11 +282,13 @@ it('ACTIVE promotion requires both real local deliveries and restart replays a c
  const id=randomUUID(),dir=join(root,'cases',id),intent={...pending.intent,attemptId:id};
  await mkdir(dir,{mode:0o700});
  const spool=await LocalSpool.open(join(dir,'capture'),spoolLimits()),capture=await spool.createResponseCapture(id);await capture.interrupt();
- const diagnostic={attemptId:id,...new InspectionDiagnostics().snapshot()};
+ const diagnostics=new InspectionDiagnostics();diagnostics.observe({kind:'failure',errorCode:'CONNECTION_FAILED'});
+ const diagnostic={attemptId:id,...diagnostics.snapshot()};
  const proof={kind:'olos-local-not-dispatched/v1',attemptId:id,diagnosticDigest:digest(diagnostic),evidence:'CONTROLLED_RPC_HANDOFF_NOT_REACHED_AFTER_TRANSPORT_CLOSED'};
  await writeFile(join(root,`attempt-${id}.json`),JSON.stringify(intent),{mode:0o600});
  await writeFile(join(dir,'diagnostic.json'),JSON.stringify(diagnostic),{mode:0o600});
  await writeFile(join(dir,'not-dispatched.json'),JSON.stringify(proof),{mode:0o600});
+ await writeFile(join(dir,'remote-state.json'),JSON.stringify({state:'REMOTE_OUTCOME_UNKNOWN',attemptId:id,retryRemote:false}),{mode:0o600});
  await writeFile(join(base,'remote-pending.json'),JSON.stringify({attemptId:id,workDir:root,configurationDigest:pending.loaded.configurationDigest}),{mode:0o600});
  expect(await serviceCycle({base,root,configFile:join(root,'config.json'),intervalMs:120000},pools,new AbortController().signal)).toEqual({received:0,persisted:0,duplicates:0,rejected:0,confirmedAt:null,acquisitionPerformed:false});
  expect(JSON.parse(await readFile(join(dir,'not-dispatched-closed.json'),'utf8'))).toEqual(proof);

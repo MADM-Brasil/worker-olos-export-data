@@ -325,6 +325,14 @@ recebidos. O caso LogReadData anterior não recebe esse certificado retroativame
 
 ### Encerramento local de tentativa comprovadamente não despachada
 
+O fechamento agora reconcilia também um run PostgreSQL vinculado por identidade
+durável do spool, sob transação e auditoria append-only (migration manual 009).
+Lease expirada ou run único não provam esse vínculo. Consulte o
+[protocolo transacional e procedimento no Dokploy](not-dispatched-run-closure.md),
+inclusive para capturas que a CLI antiga já encerrou localmente e para
+`COMMIT_UNKNOWN`. `alreadyClosed` descreve os arquivos; quando existe run vinculado,
+confira também `runClosure`. A inicialização revalida o ledger e as evidências.
+
 Em `BOOTSTRAP` também é possível executar explicitamente a mesma rotina de
 encerramento usada por `serviceCycle()`, sem ativar o serviço:
 

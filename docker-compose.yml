@@ -32,7 +32,7 @@ services:
       NODE_ENV: production
       HOME: /home/node
       HTTP_HOST: 0.0.0.0
-      HTTP_PORT: "3000"
+      HTTP_PORT: "3100"
       LOG_LEVEL: ${WORKER_LOG_LEVEL:-info}
       SYNC_ENABLED: "false"
       STATUS_TOKEN: ""

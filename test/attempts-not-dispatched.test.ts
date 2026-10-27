@@ -62,7 +62,7 @@ beforeEach(async()=>{
  const data={attemptId:id,...diagnostic.snapshot()};
  await save(join(dir,'diagnostic.json'),data);
  await save(join(dir,'not-dispatched.json'),{kind:'olos-local-not-dispatched/v1',attemptId:id,diagnosticDigest:digest(data),evidence:'CONTROLLED_RPC_HANDOFF_NOT_REACHED_AFTER_TRANSPORT_CLOSED'});
- await save(join(dir,'remote-state.json'),{state:'REMOTE_OUTCOME_UNKNOWN'});
+ await save(join(dir,'remote-state.json'),{state:'REMOTE_OUTCOME_UNKNOWN',attemptId:id,retryRemote:false});
  await save(join(root,`attempt-${id}.json`),captureIntentSchema.parse({attemptId:id,procedure:'ReadDataCurrentDay',configurationDigest:loaded.configurationDigest,workDir:root,createdAt:new Date().toISOString(),controlDate:'2026-10-23',operator:'test',approvalReference:'synthetic',pinApprovalId:'unused',contractReviewDigest:null,plan:null,state:'PREPARED'}));
  await save(join(base,'remote-pending.json'),{attemptId:id,workDir:root,configurationDigest:loaded.configurationDigest});
 });
