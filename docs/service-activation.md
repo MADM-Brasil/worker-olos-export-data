@@ -6,6 +6,36 @@ Nenhum comando deste documento foi executado contra a Olos durante o desenvolvim
 Os exemplos com `<...>` são incompletos propositalmente: precisam de informações e
 aprovações reais. Não copiar aprovações de fixtures ou de outra operação.
 
+## Probe PostgreSQL e métricas
+
+Cada probe mantém as verificações obrigatórias de conexão, identidade das três
+roles, privilégios de tabelas/colunas e contrato do destino. Falhas nessas
+verificações continuam retornando `POSTGRES_RUNTIME_NOT_READY`.
+
+As contagens de `raw.olos_calls`, `projection_outbox`, totais de ingestão e posições
+de checkpoints são telemetria: a coleta começa em segundo plano após um probe
+válido, sem aguardar seu resultado para inicializar. Existe apenas uma coleta em
+andamento por instância e um intervalo mínimo de **10 minutos entre tentativas**,
+inclusive quando há timeout. Os ciclos de 120 segundos e probes de health não
+forçam uma nova coleta dentro desse intervalo. Os timeouts dos pools não mudam.
+
+No `/status`, `statisticsStatus` distingue `refreshing`, `cached`, `stale` e
+`unavailable`. `statisticsAttemptedAt` indica o início da tentativa e
+`statisticsCheckedAt` a conclusão da última amostra completa; valores `cached`
+são dessa amostra, não contagens em tempo real. `statisticsAvailable=false`
+oculta os agregados com `null`, inclusive checkpoints, quando vencidos, em coleta
+ou indisponíveis. `statisticsError` contém apenas o diagnóstico sanitizado.
+Uma falha parcial nunca publica valores misturados de tentativas diferentes.
+`recoveryPending=null` significa que a telemetria não permite concluir esse estado;
+não equivale a ausência de pendências.
+
+O bloqueio administrativo anterior ao bootstrap consulta `EXISTS` diretamente,
+sob o mesmo lock de instância, usando os mesmos estados de runs e entregas. Ele
+não usa métricas em cache, e uma falha nessa consulta continua impedindo a operação.
+Os protocolos de aquisição, recuperação, fila, checkpoints e entrega permanecem
+inalterados. Métricas indisponíveis não habilitam aquisição nem substituem essas
+validações. Esta separação não comprova desempenho ou prontidão na VPS.
+
 ## Estados e armazenamento
 
 - `BOOTSTRAP`: captura única em quarentena, revisão explícita e importação local.

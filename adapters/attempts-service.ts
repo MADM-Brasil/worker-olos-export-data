@@ -338,7 +338,7 @@ async function withLocalLock<T>(options:ServiceOptions,operation:(pools:RuntimeP
  const abort=new AbortController(),cancel=()=>abort.abort(),pools=createLocalRuntimePools(settings.passwords,cancel,settings.postgres),probe=new AttemptsService(pools);
  let lock:PoolClient|undefined;process.once('SIGINT',cancel);process.once('SIGTERM',cancel);
  try{lock=await pools.ingest.connect();lock.on('error',cancel);if(!(await lock.query('SELECT pg_try_advisory_lock(740219,1) AS acquired')).rows[0].acquired)throw Error('INSTANCE_BUSY');
-  await probe.probe();if(!allowLocalRecovery && probe.snapshot().recoveryPending)throw Error('RECOVERY_REQUIRED');return await operation(pools,abort.signal);
+  await probe.probe();if(!allowLocalRecovery && await probe.checkRecoveryPending())throw Error('RECOVERY_REQUIRED');return await operation(pools,abort.signal);
  }finally{process.removeListener('SIGINT',cancel);process.removeListener('SIGTERM',cancel);if(lock){await lock.query('SELECT pg_advisory_unlock(740219,1)').catch(()=>{});lock.release(true);}await probe.stop();}
 }
 /** Caller holds the existing instance lock. Closure never authorizes or performs acquisition. */

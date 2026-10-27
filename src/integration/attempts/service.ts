@@ -3,7 +3,10 @@ import { AttemptsRuntimeControl,type WorkerRuntime,type CycleCounts } from './ru
 import { attemptsBlockers } from './contracts.js';
 import {assertAttemptsDestinationSchema} from './destination-schema.js';
 import {setTimeout as delay} from 'node:timers/promises';
-import {annotateFailure,logWorkerFailure,preserveFailure,type FailureContext} from '../../diagnostics/worker-failure.js';
+import {annotateFailure,failureDetails,logWorkerFailure,preserveFailure,type FailureContext} from '../../diagnostics/worker-failure.js';
+
+const STATISTICS_INTERVAL_MS=10*60*1000;
+const emptyAggregates=()=>({totalCalls:null,withCpf:null,withEmail:null,withAgentName:null,pendingDeliveries:null,confirmedDeliveries:null,checkpoints:null,ingestionTotals:null});
 
 export interface RuntimePools {ingest:Pool;project:Pool;receiver:Pool;}
 export interface LocalDeliveryWork {initialize(signal:AbortSignal):Promise<void>;step(signal:AbortSignal):Promise<boolean>;}
@@ -11,7 +14,10 @@ export class AttemptsService implements WorkerRuntime {
   private readonly control:AttemptsRuntimeControl;
   private database:'unknown'|'up'|'down'='unknown';
   private schemaReady=false;
-  private aggregates:Record<string,unknown>={totalCalls:null,withCpf:null,withEmail:null,withAgentName:null,pendingDeliveries:null,confirmedDeliveries:null,checkpoints:[]};
+  private aggregates:Record<string,unknown>=emptyAggregates();
+  private statisticsTask:Promise<void>|undefined;
+  private statisticsAttemptedAt:number|null=null;
+  private statisticsError:ReturnType<typeof failureDetails>|null=null;
   private refreshTask:Promise<void>|undefined;
   private starting:Promise<void>|undefined;
   private closing:Promise<void>|undefined;
@@ -59,19 +65,36 @@ export class AttemptsService implements WorkerRuntime {
       const c=await this.pools.receiver.connect();
       try{await c.query('BEGIN READ ONLY');
         await assertAttemptsDestinationSchema(c);
-        const calls=(await c.query(`SELECT count(*)::text AS "totalCalls",count(cpf)::text AS "withCpf",count(email)::text AS "withEmail",count(nome_agente)::text AS "withAgentName" FROM raw.olos_calls`)).rows[0];
-        await c.query('COMMIT');this.aggregates={...this.aggregates,...calls};
+        await c.query('COMMIT');
       }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
+      this.schemaReady=true;
+      if(!this.authorizedCycle && !this.stopping)this.control.block(['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]);
+    }catch(error) {this.schemaReady=false;this.database=connected?'up':'down';
+      const failure=annotateFailure(preserveFailure(Error('POSTGRES_RUNTIME_NOT_READY'),error),{flow:'probe',stage:'PROBE'});
+      if(this.authorizedCycle && this.control.snapshot().armed)this.fail(failure,{flow:'probe',stage:'PROBE'});throw failure;}
+    // Observability must neither delay readiness nor stop acquisition. Failures also observe the cooldown.
+    if(!this.stopping && !this.statisticsTask && (this.statisticsAttemptedAt===null || Date.now()-this.statisticsAttemptedAt>=STATISTICS_INTERVAL_MS)){
+      this.statisticsAttemptedAt=Date.now();
+      this.statisticsTask=this.refreshStatistics().finally(()=>{this.statisticsTask=undefined;});
+    }
+  }
+  private async refreshStatistics(){
+    try{
+      const calls=(await this.pools.receiver.query(`SELECT count(*)::text AS "totalCalls",count(cpf)::text AS "withCpf",count(email)::text AS "withEmail",count(nome_agente)::text AS "withAgentName" FROM raw.olos_calls`)).rows[0];
       const outbox=(await this.pools.project.query(`SELECT count(*) FILTER(WHERE state<>'confirmed')::text AS "pendingDeliveries",count(*) FILTER(WHERE state='confirmed')::text AS "confirmedDeliveries" FROM olos_export.projection_outbox`)).rows[0];
       const checkpoints=(await this.pools.ingest.query(`SELECT c.version::text,c.last_batch_id FROM olos_export.checkpoints c JOIN olos_export.streams s ON s.id=c.stream_id WHERE s.source_table='AttemptsRawData' ORDER BY s.id`)).rows;
       const totals=(await this.pools.ingest.query(`SELECT coalesce(sum(received_count),0)::text AS received,coalesce(sum(persisted_count),0)::text AS persisted,
         coalesce(sum(duplicate_count),0)::text AS duplicates,count(*) FILTER(WHERE state IN ('read_intent','persisting','needs_reconciliation'))::text AS unresolved
         FROM olos_export.runs WHERE source_table='AttemptsRawData'`)).rows[0];
-      this.aggregates={...this.aggregates,...outbox,checkpoints,ingestionTotals:totals};this.schemaReady=true;this.checkedAt=new Date().toISOString();
-      if(!this.authorizedCycle && !this.stopping)this.control.block(['ATTEMPTS_CORPORATE_CONTRACT_UNCONFIRMED',...attemptsBlockers]);
-    }catch(error) {this.schemaReady=false;this.database=connected?'up':'down';
-      const failure=annotateFailure(preserveFailure(Error('POSTGRES_RUNTIME_NOT_READY'),error),{flow:'probe',stage:'PROBE'});
-      if(this.authorizedCycle && this.control.snapshot().armed)this.fail(failure,{flow:'probe',stage:'PROBE'});throw failure;}
+      // Publish only a complete sample; never mix new counts with values from an older attempt.
+      this.aggregates={...calls,...outbox,checkpoints,ingestionTotals:totals};this.checkedAt=new Date().toISOString();this.statisticsError=null;
+    }catch(error){this.aggregates=emptyAggregates();this.statisticsError=failureDetails(error);}
+  }
+  /** Administrative safety check: exact existing predicates, independent of cached telemetry. */
+  async checkRecoveryPending():Promise<boolean>{
+    const runs=(await this.pools.ingest.query(`SELECT EXISTS(SELECT 1 FROM olos_export.runs WHERE source_table='AttemptsRawData' AND state IN ('read_intent','persisting','needs_reconciliation')) AS pending`)).rows[0];
+    const outbox=(await this.pools.project.query(`SELECT EXISTS(SELECT 1 FROM olos_export.projection_outbox WHERE state<>'confirmed') AS pending`)).rows[0];
+    return this.control.snapshot().state==='needs_reconciliation' || runs.pending || outbox.pending;
   }
   start():Promise<void>{
     if(this.starting)return this.starting;
@@ -104,12 +127,18 @@ export class AttemptsService implements WorkerRuntime {
   snapshotNextExecutionAt(){return this.control.snapshot().nextExecutionAt;}
   snapshotDatabaseState(){return this.database;}
   snapshotBaseArmed(){return this.control.snapshot().armed;}
-  snapshot(){const totals=this.aggregates.ingestionTotals as {unresolved:string}|undefined;
+  snapshot(){
+    const statisticsAvailable=this.checkedAt!==null && this.statisticsError===null && !this.statisticsTask && this.statisticsAttemptedAt!==null && Date.now()-this.statisticsAttemptedAt<STATISTICS_INTERVAL_MS;
+    const aggregates=statisticsAvailable?this.aggregates:emptyAggregates();
+    const totals=aggregates.ingestionTotals as {unresolved:string}|null;
     return {...this.control.snapshot(),lastFailure:this.control.snapshot().lastFailure??this.startupFailure,enabled:this.ready(),countsScope:'ingestion_last_completed_cycle',sourceConfigured:Boolean(this.authorizedCycle),sourceAuthorized:Boolean(this.authorizedCycle),
-    sourceKind:this.authorizedCycle?this.sourceKind:'corporate-blocked',databaseState:this.database,schemaReady:this.schemaReady,statisticsAvailable:this.schemaReady,statisticsCheckedAt:this.checkedAt,
-    recoveryPending:this.control.snapshot().state==='needs_reconciliation' || Boolean(totals && totals.unresolved!=='0') || Number(this.aggregates.pendingDeliveries)>0,...this.aggregates,...this.operationalSnapshot?.()};}
+    sourceKind:this.authorizedCycle?this.sourceKind:'corporate-blocked',databaseState:this.database,schemaReady:this.schemaReady,statisticsAvailable,statisticsCheckedAt:this.checkedAt,
+    statisticsStatus:this.statisticsTask?'refreshing':this.statisticsError?'unavailable':statisticsAvailable?'cached':this.checkedAt?'stale':'unavailable',
+    statisticsAttemptedAt:this.statisticsAttemptedAt===null?null:new Date(this.statisticsAttemptedAt).toISOString(),statisticsRefreshIntervalMs:STATISTICS_INTERVAL_MS,statisticsError:this.statisticsError,
+    recoveryPending:this.control.snapshot().state==='needs_reconciliation'?true:statisticsAvailable?Boolean(totals && totals.unresolved!=='0') || Number(aggregates.pendingDeliveries)>0:null,...aggregates,...this.operationalSnapshot?.()};}
   stop():Promise<void>{this.closing ??=this.close();return this.closing;}
   private async close(){this.stopping=true;this.abort.abort();await this.starting;await this.control.stop();await this.deliveryTask;await this.refreshTask?.catch(()=>{});
+    await this.statisticsTask;
     if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(740219,1)').catch(()=>{});this.lock.release(true);this.lock=undefined;}
     const results=await Promise.allSettled(Object.values(this.pools).map(p=>p.end()));if(results.some(r=>r.status==='rejected'))throw Error('RUNTIME_POOL_CLOSE_FAILED');
   }

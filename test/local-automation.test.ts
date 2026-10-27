@@ -57,7 +57,7 @@ describe('HTTP + actual pipeline with three isolated PostgreSQL logins, no Olos'
  afterAll(async()=>{await db?.stop();if(dir)await rm(dir,{recursive:true,force:true});},30000);
  it('safe HTTP is alive and blocked, with actual destination counts and no invented checkpoint',async()=>{
   const runtime=new AttemptsService(pools());const app=buildApp(config(),[],runtime);
-  try{await app.listen({host:'127.0.0.1',port:0});await until(()=>runtime.snapshot().schemaReady===true);
+  try{await app.listen({host:'127.0.0.1',port:0});await until(()=>runtime.snapshot().statisticsAvailable===true);
    expect((await app.inject('/health/live')).statusCode).toBe(200);expect((await app.inject('/health/ready')).json()).toMatchObject({syncEnabled:false,reason:'acquisition_blocked'});
    expect(runtime.snapshot()).toMatchObject({state:'blocked',sourceAuthorized:false,totalCalls:'1',confirmedDeliveries:'0',checkpoints:[]});
    expect((await app.inject('/status')).statusCode).toBe(401);
@@ -71,8 +71,11 @@ describe('HTTP + actual pipeline with three isolated PostgreSQL logins, no Olos'
   const second=createAutomatedAttemptsService(pools(),spool,limits,binding(rawSource(1)),1000);
   const app=buildApp(config(),[],runtime);
   try{await app.listen({host:'127.0.0.1',port:0});await until(()=>runtime.snapshot().state==='running');await second.start();expect(second.snapshot().state).toBe('blocked');await second.stop();
+   await until(()=>runtime.snapshot().statisticsAvailable===true);const statisticsCheckedAt=runtime.snapshot().statisticsCheckedAt;
    await until(()=>runtime.snapshot().completedCycles===1);expect(source.calls).toBe(1);expect((await app.inject('/health/ready')).statusCode).toBe(200);
-   expect(runtime.snapshot()).toMatchObject({sourceKind:'isolated-fixture',totalCalls:'3',confirmedDeliveries:'3',received:3,persisted:3});
+   expect(runtime.snapshot()).toMatchObject({sourceKind:'isolated-fixture',statisticsStatus:'cached',statisticsCheckedAt,received:3,persisted:3});
+   expect((await db.admin.query('SELECT count(*)::text AS n FROM raw.olos_calls')).rows[0].n).toBe('3');
+   expect((await db.admin.query("SELECT count(*)::text AS n FROM olos_export.projection_outbox WHERE state='confirmed'")).rows[0].n).toBe('3');
    expect((await db.admin.query('SELECT telefone,nome_agente FROM raw.olos_calls WHERE internal_id_olos=1')).rows[0]).toEqual({telefone:'synthetic historical value',nome_agente:'synthetic historical agent'});
    expect((await db.admin.query('SELECT version FROM olos_export.checkpoints')).rows[0].version).toBe('1');
   }finally{await app.close();await second.stop();}
