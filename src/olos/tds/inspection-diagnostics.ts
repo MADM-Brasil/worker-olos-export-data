@@ -100,7 +100,9 @@ export class InspectionDiagnostics {
     if(event.stage==='RESPONSE_CAPTURE_STARTED')this.outcome='UNKNOWN';
     if(event.stage==='RESPONSE_VALIDATED')this.outcome='RESPONSE_VALIDATED';
   };
-  snapshot(){return {version:'olos-log-inspection-diagnostic/v1' as const,
+  // v1 historically had two shapes. v2 always includes transport; never add a
+  // required wire field without a new version and an explicit reader policy.
+  snapshot(){return {version:'olos-log-inspection-diagnostic/v2' as const,
     phase:this.failure?.phase??stagePhases[this.stage],lastObservedStage:this.failure?.lastObservedStage??this.stage,
     errorCode:this.failure?.errorCode??null,observedStages:[...this.observed],rpcDispatchState:this.dispatch,
     remoteExecutionOutcome:this.outcome,retryRemote:false as const,transport:this.transport.map(detail=>({...detail}))};}

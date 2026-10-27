@@ -30,6 +30,76 @@ esta entrega não afirma que o incidente real já pode ser liberado.
 
 ## Protocolo
 
+### Compatibilidade do diagnóstico e fechamentos históricos
+
+Antes de `e53ad7b`, `InspectionDiagnostics.snapshot()` emitia a versão
+`olos-log-inspection-diagnostic/v1` sem o campo `transport`. Esse commit adicionou
+o campo sem alterar a versão. A validação introduzida em `f360ccc` passou a exigir
+um array para todo v1, rejeitando inclusive fechamentos antigos íntegros antes
+de chegar à transação. Essa incompatibilidade é reproduzida nos testes de
+inicialização da fila; não depende da presença da migration 009.
+
+O produtor agora emite **`olos-log-inspection-diagnostic/v2`**, sempre com
+`transport`. O contrato dos leitores é explícito:
+
+| Formato | Regra |
+| --- | --- |
+| v1 sem propriedade `transport` | Apenas revalidação de fechamento local histórico já concluído, nas condições abaixo. |
+| v1 com `transport` | Mantém todas as validações existentes do array e de suas entradas. |
+| v2 | `transport` obrigatório; ausência, `null` e valores inválidos são recusados. |
+| Versão desconhecida | Recusa. |
+
+O reconhecimento histórico usa o conjunto exato de campos, fases, estágios e
+códigos de erro do produtor anterior a `e53ad7b`, congelado em
+`src/olos/tds/historical-not-dispatched-diagnostic.ts`. A sequência deve começar
+em autorização e manter a ordem dos estágios anteriores ao despacho, sem
+duplicações. Campos novos, estágios/códigos introduzidos posteriormente e versões
+novas incompletas não são interpretados como legado. Datas, prefixos de IDs e
+mtime não são critérios de identificação.
+
+A exceção só opera em `verifyOnly=true`, com marker já arquivado, proof original
+vinculado ao digest do diagnóstico, `not-dispatched-closed.json` correspondente
+e **nenhum diretório de importação**. Recusa marker pendente para a mesma captura,
+resposta pronta, bytes recebidos, captura enfileirada/entregue ou qualquer
+incompatibilidade das demais provas. Fase/erro são reconstruídos, as identidades
+são conferidas e os arquivos continuam privados, sem symlinks e sob o mesmo UID.
+O arquivo de fechamento histórico também integra as evidências revalidadas
+dentro da transação, inclusive antes do commit.
+
+Não se adiciona `transport: []`, não se normaliza o diagnóstico e não se regrava
+nenhum arquivo/proof/digest histórico. A comparação usa o JSON original. O ramo
+sem manifest continua recusando contradição com ledger existente e não muda
+runs, source locks, fencing ou checkpoints. Os bloqueios globais de inicialização
+para outros runs/capturas continuam valendo. A exceção não cria fechamentos novos
+e não permite executar fechamento transacional a partir de um diagnóstico legado.
+
+**Limite de proveniência:** o v1 original não possui assinatura, versão do build
+ou carimbo de tempo confiável. Não existe distinção criptográfica entre um
+histórico legítimo e uma substituição coordenada de diagnóstico, proof, fechamento
+e demais artefatos por alguém com controle do volume. O reconhecimento exige o
+formato histórico completo e sua cadeia de evidências preservada, sob a mesma
+premissa de custódia do protocolo existente. Não promete autenticação que os
+artefatos não oferecem. Alterações isoladas, digests divergentes, formatos
+incompatíveis e tentativas de usar a exceção em fechamento novo são recusadas.
+
+Mudanças futuras em campos obrigatórios ou semântica exigem nova versão do
+diagnóstico e política explícita de leitura; o vocabulário histórico congelado
+não deve acompanhar adições ao produtor. Os testes cobrem a fila real em bases
+descartáveis anteriores/posteriores à 009, múltiplos históricos, v1 com transporte,
+v2, reinicialização, imutabilidade dos arquivos e preservação de runs alheios.
+
+Validação local em 27/10/2026: `npm run typecheck` e `npm run build` aprovados;
+`npm test -- --maxWorkers=2 --testTimeout=60000` com **1.022 aprovados e 5 opcionais
+ignorados**, 63 arquivos aprovados e 3 ignorados (371,82 s na execução final).
+Os 90 casos novos também passaram isoladamente, incluindo remoção concorrente do
+fechamento e criação concorrente de importação durante a transação. A preparação
+SQL ocorreu somente nas fixtures PostgreSQL descartáveis da suíte. Não houve
+aplicação operacional de migrations, acesso à VPS/OLOS ou RPC real. Essa evidência
+local não declara o worker pronto para produção nem resolve o run independente
+com 200.000 registros selados.
+
+### Fechamento transacional
+
 1. A CLI mantém a autorização privada, o probe de roles/schema/destino e o advisory
    lock de instância `(740219,1)`. Não inicia scheduler, recovery ou conexão OLOS.
 2. Valida intenção e marker atual/arquivado, UUID, diretório e configuration digest;

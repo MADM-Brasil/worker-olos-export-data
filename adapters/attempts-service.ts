@@ -23,6 +23,7 @@ import {hasUnresolvedCorporateInspection,prepareCorporateAttemptsEndpoint,author
 import {IsolatedTdsSource,replayTdsResponse} from '../src/olos/tds/source.js';
 import {parserLimits} from '../src/olos/tds/raw-parser.js';
 import {InspectionDiagnostics,inspectionErrorCode,reportInspectionFailure} from '../src/olos/tds/inspection-diagnostics.js';
+import {isHistoricalNotDispatchedDiagnostic} from '../src/olos/tds/historical-not-dispatched-diagnostic.js';
 import {createApprovedCaptureReplayBinding} from '../src/integration/attempts/corporate.js';
 import {decodeWireRow} from '../src/large-batch/wire.js';
 import {projectTdsAttempts} from '../src/offline/tds-projection.js';
@@ -357,22 +358,23 @@ export async function closeNotDispatchedServiceCase(options:ServiceOptions,attem
  const proofPath=join(dir,'not-dispatched.json'),diagnosticPath=join(dir,'diagnostic.json');
  const proof=z.object({kind:z.literal('olos-local-not-dispatched/v1'),attemptId:z.string().uuid(),diagnosticDigest:sha,
   evidence:z.literal('CONTROLLED_RPC_HANDOFF_NOT_REACHED_AFTER_TRANSPORT_CLOSED')}).strict().parse(await privateJson(proofPath));
- const diagnostic=await privateJson(diagnosticPath) as ReturnType<InspectionDiagnostics['snapshot']> & {attemptId:string};
+ const diagnostic=await privateJson(diagnosticPath) as Omit<ReturnType<InspectionDiagnostics['snapshot']>,'version'> & {version:string;attemptId:string};
+ const historical=verifyOnly && !Object.hasOwn(diagnostic,'transport') && isHistoricalNotDispatchedDiagnostic(diagnostic);
  const preDispatchStages=['AUTHORIZATION_STARTED','PERMIT_ISSUED','CONNECTION_INIT_STARTED','SOCKET_CONNECTED','PRELOGIN_SENT','PRELOGIN_RESPONSE_RECEIVED',
   'TLS_HANDSHAKE_STARTED','TLS_VALIDATED','SQL_LOGIN_PREPARATION','SQL_LOGIN_STARTED','SQL_LOGIN_ACCEPTED'];
  if(proof.kind!=='olos-local-not-dispatched/v1' || proof.attemptId!==attemptId || proof.evidence!=='CONTROLLED_RPC_HANDOFF_NOT_REACHED_AFTER_TRANSPORT_CLOSED' ||
   proof.diagnosticDigest!==digest(diagnostic) || diagnostic.attemptId!==attemptId || diagnostic.rpcDispatchState!=='NOT_OBSERVED' || diagnostic.remoteExecutionOutcome!=='NOT_OBSERVED' ||
-  diagnostic.version!=='olos-log-inspection-diagnostic/v1' || diagnostic.retryRemote!==false || !diagnostic.errorCode ||
+  !['olos-log-inspection-diagnostic/v1','olos-log-inspection-diagnostic/v2'].includes(diagnostic.version) || diagnostic.retryRemote!==false || !diagnostic.errorCode ||
   !Array.isArray(diagnostic.observedStages) || diagnostic.observedStages[0]!=='AUTHORIZATION_STARTED' ||
   new Set(diagnostic.observedStages).size!==diagnostic.observedStages.length ||
   diagnostic.lastObservedStage!==diagnostic.observedStages.at(-1) || diagnostic.observedStages.some(stage=>!preDispatchStages.includes(stage)) ||
-  !Array.isArray(diagnostic.transport) || diagnostic.transport.some(t=>!preDispatchStages.includes(t.lastObservedStage)))throw Error('RECOVERY_REQUIRED');
+  (!historical && (!Array.isArray(diagnostic.transport) || diagnostic.transport.some(t=>!preDispatchStages.includes(t.lastObservedStage)))))throw Error('RECOVERY_REQUIRED');
  // Reconstruct the diagnostic protocol: phase, failure code and transport observations must agree.
  const reconstructed=new InspectionDiagnostics();
  for(const stage of diagnostic.observedStages)reconstructed.observe({kind:'stage',stage});
  reconstructed.observe({kind:'failure',errorCode:diagnostic.errorCode});
  if(reconstructed.snapshot().phase!==diagnostic.phase || reconstructed.snapshot().errorCode!==diagnostic.errorCode)throw Error('RECOVERY_REQUIRED');
- for(const entry of diagnostic.transport){
+ for(const entry of historical?[]:diagnostic.transport){
   if(!diagnostic.observedStages.includes(entry.lastObservedStage))throw Error('RECOVERY_REQUIRED');
   const transport=new InspectionDiagnostics();transport.observe({kind:'stage',stage:entry.lastObservedStage});
   transport.observe({...entry,kind:'transport'});
@@ -384,6 +386,12 @@ export async function closeNotDispatchedServiceCase(options:ServiceOptions,attem
   sha256:z.literal(createHash('sha256').digest('hex')),contractApproved:z.literal(false),businessDelivered:z.literal(false),checkpointAdvanced:z.literal(false)}).strict().parse(await privateJson(responsePath));
  const boundFiles:Array<readonly [string,unknown]>=[[markerPath,marker],[intentPath,intent],[proofPath,proof],[diagnosticPath,diagnostic],[remotePath,remote],[responsePath,response]];
  const importRoot=join(dir,'import'),batchesPath=join(importRoot,'batches');
+ // This compatibility branch verifies immutable history; it cannot create a
+ // closure or authorize closing any PostgreSQL run. Bind the old closure too.
+ if(historical){
+  if(!await serviceExists(closed) || await serviceExists(importRoot))throw Error('RECOVERY_REQUIRED');
+  boundFiles.push([closed,proof]);
+ }
  let manifest:SpoolManifest|null=null,recordPath:string|undefined,batchNames:string[]=[];
  if(await serviceExists(importRoot)){
   await privateDirectory(importRoot);await privateDirectory(batchesPath);batchNames=await readdir(batchesPath);
@@ -401,6 +409,7 @@ export async function closeNotDispatchedServiceCase(options:ServiceOptions,attem
  if(pendingExists && await serviceExists(archive))throw Error('RECOVERY_REQUIRED');
  const assertEvidence=()=>{
   assertCurrent();
+  if(historical && (existsSync(importRoot) || existsSync(pendingPath) && (privateServiceJsonSync(pendingPath) as {attemptId?:string}).attemptId===attemptId))throw Error('RECOVERY_REQUIRED');
   for(const [path,value] of boundFiles)
    if(digest(privateServiceJsonSync(path))!==digest(value))throw Error('RECOVERY_REQUIRED');
   if(pendingExists && existsSync(archive))throw Error('RECOVERY_REQUIRED'); // Never overwrite archived evidence.
