@@ -1,5 +1,9 @@
 # Ativação operacional do Worker Attempts
 
+Para reconhecer a lease expirada de **um único run**, antes de uma reconciliação
+local posterior, consulte [reconhecimento seletivo de expiração](selective-expired-run-recognition.md).
+Essa operação não percorre capturas, não importa o spool e não inicia o scheduler.
+
 Este fluxo é opt-in pela configuração `olos-service/v2`, na CLI existente
 `worker:attempts`. O boot genérico e a configuração v1 continuam compatíveis.
 Nenhum comando deste documento foi executado contra a Olos durante o desenvolvimento.

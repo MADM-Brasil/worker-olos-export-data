@@ -24,6 +24,8 @@ import {IsolatedTdsSource,replayTdsResponse} from '../src/olos/tds/source.js';
 import {parserLimits} from '../src/olos/tds/raw-parser.js';
 import {InspectionDiagnostics,inspectionErrorCode,reportInspectionFailure} from '../src/olos/tds/inspection-diagnostics.js';
 import {isHistoricalNotDispatchedDiagnostic} from '../src/olos/tds/historical-not-dispatched-diagnostic.js';
+import {PostgresPersistence} from '../src/persistence/store.js';
+import {expiredRunSelectionSchema} from '../src/persistence/expired-run-selection.js';
 import {createApprovedCaptureReplayBinding} from '../src/integration/attempts/corporate.js';
 import {decodeWireRow} from '../src/large-batch/wire.js';
 import {projectTdsAttempts} from '../src/offline/tds-projection.js';
@@ -783,6 +785,15 @@ export async function serviceCommand(action:string,options:ServiceOptions,flags:
  await directories(options.base,options.root);
  if(action==='reconcile-inspection')return reconcileServiceInspection(options.base,await privateJson(flags['--decision-file']!));
  const {loaded,approval,guard}=await serviceAuthorization(options);guard();
+ if(action==='recognize-expired-run'){
+  if(flags['--confirm']!=='AUTHORIZE_EXPIRED_RUN_RECOGNITION')throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
+  const selection=expiredRunSelectionSchema.parse({runId:flags['--run-id'],source:flags['--source'],expectedGeneration:flags['--expected-generation']});
+  return withLocalLock(options,async(pools,signal)=>{
+   const assertCurrent=()=>{guard();if(signal.aborted)throw Error('ABORTED');};
+   const result=await new PostgresPersistence(pools.ingest).recognizeExpiredRun(selection,assertCurrent);
+   return {event:'expired_run_recognized',...result,acquisitionPerformed:false,imported:0,schedulerStarted:false,retryRemote:false};
+  },true);
+ }
  if(action==='close-not-dispatched')return withLocalLock(options,async(pools,signal)=>({
   event:'service_not_dispatched_closed',...await closeNotDispatchedServiceCase(options,flags['--attempt-id']!,loaded.configurationDigest,guard,signal,pools),
   acquisitionPerformed:false,schedulerStarted:false,retryRemote:false

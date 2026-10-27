@@ -5,6 +5,7 @@ import { PersistenceError, defaultLimits, type BatchCounts, type Checkpoint, typ
 import { assertContract, assertTable, assertUuid, assertVersion, validDate, targets, prepareRecords, batchDigest, deduplicate } from './validation.js';
 import { transaction } from './transaction.js';
 import { captureBatch, captureConfig, verifyCapture, type CaptureConfig } from '../projection/capture.js';
+import {expiredRunSelectionSchema,type ExpiredRunSelection} from './expired-run-selection.js';
 
 interface RunRow {
   id: string; stream_id: string; source_table: SourceContract['source_table']; contract_version: string;
@@ -249,20 +250,65 @@ export class PostgresPersistence {
     });
   }
 
+  /** Shared expiration transition; caller holds the source lock throughout the transaction. */
+  private async expireLockedRun(client:PoolClient,lock:{source_table:string;owner_run_id:string;generation:string},preserveBatches=false){
+    await client.query("UPDATE olos_export.runs SET state='needs_reconciliation' WHERE id=$1", [lock.owner_run_id]);
+    if(!preserveBatches)await client.query("UPDATE olos_export.batches SET state='needs_reconciliation' WHERE run_id=$1 AND state<>'committed'", [lock.owner_run_id]);
+    const recovery = await client.query<{ id: string }>(`INSERT INTO olos_export.recovery_cases(id,run_id,reason) VALUES ($1,$2,'expired_read_intent')
+      ON CONFLICT (run_id) DO UPDATE SET run_id=EXCLUDED.run_id RETURNING id`, [randomUUID(),lock.owner_run_id]);
+    await client.query(`INSERT INTO olos_export.audit_events(id,run_id,event,received_count,persisted_count,duplicate_count)
+      VALUES ($1,$2,'reconciliation_required',0,0,0)`, [randomUUID(),lock.owner_run_id]);
+    const released=await client.query(`UPDATE olos_export.source_locks SET generation=generation+1,owner_run_id=NULL,lease_until=NULL
+      WHERE source_table=$1 AND owner_run_id=$2 AND generation=$3 AND lease_until<=clock_timestamp()`,[lock.source_table,lock.owner_run_id,lock.generation]);
+    if(released.rowCount!==1)throw new PersistenceError('LEASE_LOST');
+    return recovery.rows[0]!.id;
+  }
+
+  /** One explicit read_intent only. No capture discovery, replay, batch mutation or scheduler. */
+  async recognizeExpiredRun(input:ExpiredRunSelection,assertAuthorized:()=>void=()=>{}){
+    const parsed=expiredRunSelectionSchema.safeParse(input);
+    if(!parsed.success)throw new PersistenceError('VALIDATION_FAILED');
+    const selected=parsed.data,releasedGeneration=(BigInt(selected.expectedGeneration)+1n).toString();
+    assertAuthorized();
+    return transaction(this.pool,async client=>{
+      // Same completion barrier/order as ingestion and reconciliation; competitors fail NOWAIT.
+      const lock=(await client.query<{source_table:string;owner_run_id:string|null;generation:string;lease_until:unknown;expired:boolean}>(
+        `SELECT *,lease_until<=clock_timestamp() AS expired FROM olos_export.source_locks WHERE source_table=$1 FOR UPDATE NOWAIT`,[selected.source])).rows[0];
+      const run=(await client.query<{source_table:string;fencing_token:string;state:string;finished_at:unknown}>(
+        'SELECT source_table,fencing_token,state,finished_at FROM olos_export.runs WHERE id=$1 FOR UPDATE NOWAIT',[selected.runId])).rows[0];
+      if(!lock || !run || run.source_table!==selected.source || run.fencing_token!==selected.expectedGeneration || run.finished_at!==null)
+        throw new PersistenceError('RECOVERY_REQUIRED');
+      const recovery=(await client.query<{id:string;reason:string;state:string;resolved_at:unknown}>(
+        'SELECT id,reason,state,resolved_at FROM olos_export.recovery_cases WHERE run_id=$1 FOR UPDATE NOWAIT',[selected.runId])).rows[0];
+      const audits=(await client.query(`SELECT id,batch_id,received_count,persisted_count,duplicate_count FROM olos_export.audit_events
+        WHERE run_id=$1 AND event='reconciliation_required'`,[selected.runId])).rows;
+      let recoveryCaseId:string,alreadyRecognized=false;
+      if(run.state==='needs_reconciliation'){
+        // A matching durable result resolves COMMIT_UNKNOWN, but never steals a successor's lock.
+        if(!recovery || recovery.reason!=='expired_read_intent' || recovery.state!=='open' || recovery.resolved_at!==null ||
+          lock.generation!==releasedGeneration || lock.owner_run_id!==null || lock.lease_until!==null || audits.length!==1 ||
+          audits[0].batch_id!==null || ['received_count','persisted_count','duplicate_count'].some(k=>audits[0][k]!==0))
+          throw new PersistenceError('RECOVERY_REQUIRED');
+        recoveryCaseId=recovery.id;alreadyRecognized=true;
+      }else{
+        if(run.state!=='read_intent' || recovery || audits.length || lock.owner_run_id!==selected.runId ||
+          lock.generation!==selected.expectedGeneration || lock.expired!==true)throw new PersistenceError('RECOVERY_REQUIRED');
+        assertAuthorized();
+        recoveryCaseId=await this.expireLockedRun(client,{source_table:selected.source,owner_run_id:selected.runId,generation:selected.expectedGeneration},true);
+      }
+      assertAuthorized();
+      return {...selected,runState:'needs_reconciliation' as const,recoveryCaseId,recoveryReason:'expired_read_intent' as const,
+        recoveryState:'open' as const,releasedGeneration,alreadyRecognized};
+    });
+  }
+
   async recoverExpired(): Promise<readonly string[]> {
     return transaction(this.pool, async client => {
-      const expired = await client.query<{ source_table: string; owner_run_id: string }>(`SELECT source_table,owner_run_id FROM olos_export.source_locks
+      const expired = await client.query<{ source_table: string; owner_run_id: string;generation:string }>(`SELECT source_table,owner_run_id,generation FROM olos_export.source_locks
         WHERE owner_run_id IS NOT NULL AND lease_until<=clock_timestamp() FOR UPDATE SKIP LOCKED`);
       const cases: string[] = [];
       for (const lock of expired.rows) {
-        await client.query("UPDATE olos_export.runs SET state='needs_reconciliation' WHERE id=$1", [lock.owner_run_id]);
-        await client.query("UPDATE olos_export.batches SET state='needs_reconciliation' WHERE run_id=$1 AND state<>'committed'", [lock.owner_run_id]);
-        const recovery = await client.query<{ id: string }>(`INSERT INTO olos_export.recovery_cases(id,run_id,reason) VALUES ($1,$2,'expired_read_intent')
-          ON CONFLICT (run_id) DO UPDATE SET run_id=EXCLUDED.run_id RETURNING id`, [randomUUID(),lock.owner_run_id]);
-        cases.push(recovery.rows[0]!.id);
-        await client.query(`INSERT INTO olos_export.audit_events(id,run_id,event,received_count,persisted_count,duplicate_count)
-          VALUES ($1,$2,'reconciliation_required',0,0,0)`, [randomUUID(),lock.owner_run_id]);
-        await client.query('UPDATE olos_export.source_locks SET generation=generation+1,owner_run_id=NULL,lease_until=NULL WHERE source_table=$1', [lock.source_table]);
+        cases.push(await this.expireLockedRun(client,lock));
       }
       return cases;
     });

@@ -24,6 +24,7 @@ import {digest,validDate} from '../src/persistence/validation.js';
 import type {AttemptsBinding} from '../src/integration/attempts/pipeline.js';
 import {z} from 'zod';
 import {serviceCommand} from './attempts-service.js';
+import {expiredRunSelectionSchema} from '../src/persistence/expired-run-selection.js';
 import {runLogInspection} from './attempts-log-inspection.js';
 
 async function exists(path:string){try{await lstat(path);return true;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}}
@@ -33,25 +34,26 @@ async function loadCatalog(path:string,key:'CampaignId'|'DispositionId',label:'C
 }
 export function parseCorporateArguments(args:readonly string[],env:NodeJS.ProcessEnv){
  const [action,...rest]=args,flags:Record<string,string>={};
- if(!action || !['once','start','recover','status','inspect-log','bootstrap','prepare-contract','approve-contract','import-capture','activate','service-status','reconcile-inspection','close-not-dispatched','recover-queue','reconcile-ingestion','discard-capture'].includes(action) || env.SYNC_ENABLED!==undefined && env.SYNC_ENABLED!=='false' || env.NODE_TLS_REJECT_UNAUTHORIZED==='0')throw Error('CORPORATE_COMMAND_REJECTED');
- for(let i=0;i<rest.length;i+=2){const k=rest[i],v=rest[i+1];if(!k || !v || !['--work-dir','--config','--confirm','--interval-ms','--date-export','--procedure','--review-file','--activation-file','--decision-file','--capture-id','--attempt-id','--queue-max-captures','--queue-max-bytes','--reconciliation-file','--discard-file'].includes(k) || Object.hasOwn(flags,k))throw Error('CORPORATE_COMMAND_REJECTED');flags[k]=v;}
+ if(!action || !['once','start','recover','status','inspect-log','bootstrap','prepare-contract','approve-contract','import-capture','activate','service-status','reconcile-inspection','close-not-dispatched','recover-queue','reconcile-ingestion','discard-capture','recognize-expired-run'].includes(action) || env.SYNC_ENABLED!==undefined && env.SYNC_ENABLED!=='false' || env.NODE_TLS_REJECT_UNAUTHORIZED==='0')throw Error('CORPORATE_COMMAND_REJECTED');
+ for(let i=0;i<rest.length;i+=2){const k=rest[i],v=rest[i+1];if(!k || !v || !['--work-dir','--config','--confirm','--interval-ms','--date-export','--procedure','--review-file','--activation-file','--decision-file','--capture-id','--attempt-id','--queue-max-captures','--queue-max-bytes','--reconciliation-file','--discard-file','--run-id','--source','--expected-generation'].includes(k) || Object.hasOwn(flags,k))throw Error('CORPORATE_COMMAND_REJECTED');flags[k]=v;}
  const base=join(homedir(),'.local','state','olos-worker','corporate-attempts'),root=flags['--work-dir']??join(base,'first-run');
  if(!root || resolve(root)!==root || !root.startsWith(`${base}/`) || root.slice(base.length+1).includes('/'))throw Error('CORPORATE_WORK_DIR_REJECTED');
  if(action!=='inspect-log' && flags['--confirm']==='AUTHORIZE_LOG_INSPECTION')throw Error('CORPORATE_COMMAND_REJECTED');
  if(action==='inspect-log' && (flags['--interval-ms']!==undefined || flags['--work-dir']!==undefined))throw Error('CORPORATE_COMMAND_REJECTED');
  const intervalMs=Number(flags['--interval-ms']??'60000');if(!Number.isSafeInteger(intervalMs) || intervalMs<60000 || intervalMs>3600000)throw Error('CORPORATE_INTERVAL_REJECTED');
  // The explicit CLI action plus the existing private authorization is sufficient; old confirmations remain accepted.
- if(action!=='status' && flags['--confirm']!==undefined && flags['--confirm']!==({once:'AUTHORIZE_ONE_ATTEMPTS_CURRENT_DAY',start:'AUTHORIZE_ATTEMPTS_RECURRING',recover:'LOCAL_RECOVERY_ONLY','inspect-log':'AUTHORIZE_LOG_INSPECTION',bootstrap:'AUTHORIZE_BOOTSTRAP_CAPTURE','approve-contract':'APPROVE_OBSERVED_CONTRACT','import-capture':'LOCAL_RECOVERY_ONLY',activate:'APPROVE_SERVICE_ACTIVATION','reconcile-inspection':'RECORD_OPERATIONAL_RECONCILIATION','service-status':undefined,'prepare-contract':undefined,'close-not-dispatched':'LOCAL_RECOVERY_ONLY','recover-queue':'LOCAL_RECOVERY_ONLY','reconcile-ingestion':'AUTHORIZE_VERIFIED_LOCAL_REPLAY','discard-capture':'AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD'} as const)[action])throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
+ if(action!=='status' && flags['--confirm']!==undefined && flags['--confirm']!==({once:'AUTHORIZE_ONE_ATTEMPTS_CURRENT_DAY',start:'AUTHORIZE_ATTEMPTS_RECURRING',recover:'LOCAL_RECOVERY_ONLY','inspect-log':'AUTHORIZE_LOG_INSPECTION',bootstrap:'AUTHORIZE_BOOTSTRAP_CAPTURE','approve-contract':'APPROVE_OBSERVED_CONTRACT','import-capture':'LOCAL_RECOVERY_ONLY',activate:'APPROVE_SERVICE_ACTIVATION','reconcile-inspection':'RECORD_OPERATIONAL_RECONCILIATION','service-status':undefined,'prepare-contract':undefined,'close-not-dispatched':'LOCAL_RECOVERY_ONLY','recover-queue':'LOCAL_RECOVERY_ONLY','reconcile-ingestion':'AUTHORIZE_VERIFIED_LOCAL_REPLAY','discard-capture':'AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD','recognize-expired-run':'AUTHORIZE_EXPIRED_RUN_RECOGNITION'} as const)[action])throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
  if (action === 'inspect-log' && flags['--confirm'] !== 'AUTHORIZE_LOG_INSPECTION')
    throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
  if (action === 'inspect-log' && (!flags['--date-export'] || !validDate(flags['--date-export'])))
    throw Error('LOG_INSPECTION_DATE_REQUIRED');
  if (action !== 'inspect-log' && flags['--date-export'] !== undefined)
    throw Error('CORPORATE_COMMAND_REJECTED');
- const actionFlags:Record<string,string>={'--attempt-id':'close-not-dispatched','--capture-id':'prepare-contract','--procedure':'bootstrap','--review-file':'approve-contract','--activation-file':'activate','--decision-file':'reconcile-inspection','--reconciliation-file':'reconcile-ingestion','--discard-file':'discard-capture'};
+ const actionFlags:Record<string,string>={'--attempt-id':'close-not-dispatched','--capture-id':'prepare-contract','--procedure':'bootstrap','--review-file':'approve-contract','--activation-file':'activate','--decision-file':'reconcile-inspection','--reconciliation-file':'reconcile-ingestion','--discard-file':'discard-capture','--run-id':'recognize-expired-run','--source':'recognize-expired-run','--expected-generation':'recognize-expired-run'};
  for(const [flag,allowedAction] of Object.entries(actionFlags))if(flags[flag]!==undefined && action!==allowedAction)throw Error('CORPORATE_COMMAND_REJECTED');
- const confirmations:Record<string,string>={'reconcile-ingestion':'AUTHORIZE_VERIFIED_LOCAL_REPLAY','discard-capture':'AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD',bootstrap:'AUTHORIZE_BOOTSTRAP_CAPTURE','approve-contract':'APPROVE_OBSERVED_CONTRACT',activate:'APPROVE_SERVICE_ACTIVATION','reconcile-inspection':'RECORD_OPERATIONAL_RECONCILIATION'};
+ const confirmations:Record<string,string>={'reconcile-ingestion':'AUTHORIZE_VERIFIED_LOCAL_REPLAY','discard-capture':'AUTHORIZE_ADMINISTRATIVE_CAPTURE_DISCARD',bootstrap:'AUTHORIZE_BOOTSTRAP_CAPTURE','approve-contract':'APPROVE_OBSERVED_CONTRACT',activate:'APPROVE_SERVICE_ACTIVATION','reconcile-inspection':'RECORD_OPERATIONAL_RECONCILIATION','recognize-expired-run':'AUTHORIZE_EXPIRED_RUN_RECOGNITION'};
  if(confirmations[action] && flags['--confirm']!==confirmations[action])throw Error('CORPORATE_AUTHORIZATION_REQUIRED');
+ if(action==='recognize-expired-run' && (flags['--interval-ms']!==undefined || !expiredRunSelectionSchema.safeParse({runId:flags['--run-id'],source:flags['--source'],expectedGeneration:flags['--expected-generation']}).success))throw Error('CORPORATE_COMMAND_REJECTED');
  if(action==='bootstrap' && !['ReadDataCurrentDay','ReadDataPreviousDays'].includes(flags['--procedure']??''))throw Error('CORPORATE_COMMAND_REJECTED');
  if(action==='close-not-dispatched' && (!z.string().uuid().safeParse(flags['--attempt-id']).success || flags['--interval-ms']!==undefined))throw Error('CORPORATE_COMMAND_REJECTED');
  if(action==='reconcile-ingestion' && (!flags['--reconciliation-file'] || flags['--interval-ms']!==undefined))throw Error('CORPORATE_COMMAND_REJECTED');
@@ -153,7 +155,7 @@ async function corporateStatus(options:ReturnType<typeof parseCorporateArguments
 /** No source operation occurs on import, boot, status or recovery. */
 export async function corporateCommand(args:readonly string[],env:NodeJS.ProcessEnv){
  const options=parseCorporateArguments(args,env),{action,base,root}=options;
- const serviceActions=['bootstrap','prepare-contract','approve-contract','import-capture','activate','service-status','reconcile-inspection','close-not-dispatched','recover-queue','reconcile-ingestion','discard-capture'];
+ const serviceActions=['bootstrap','prepare-contract','approve-contract','import-capture','activate','service-status','reconcile-inspection','close-not-dispatched','recover-queue','reconcile-ingestion','discard-capture','recognize-expired-run'];
  let serviceMode=serviceActions.includes(action);
  if(!serviceMode && ['start','status'].includes(action)){
   try{serviceMode=(await privateJson(options.configFile) as {version?:unknown}).version==='olos-service/v2';}catch{/* legacy diagnostic reports its own missing configuration */}
